@@ -27,6 +27,7 @@ use {
         ledger_cleanup_service::{DEFAULT_MAX_LEDGER_SHREDS, DEFAULT_MIN_MAX_LEDGER_SHREDS},
         pbs::pbs_stage::PbsConfig,
         system_monitor_service::SystemMonitorService,
+        tip_manager::{TipDistributionAccountConfig, TipManagerConfig},
         tpu::DEFAULT_TPU_COALESCE,
         validator::{
             is_snapshot_config_valid, BlockProductionMethod, BlockVerificationMethod, Validator,
@@ -1517,6 +1518,14 @@ pub fn main() {
             log_messages_bytes_limit: value_of(&matches, "log_messages_bytes_limit"),
             ..RuntimeConfig::default()
         },
+        relayer_config: Arc::new(Mutex::new(relayer_config)),
+        block_engine_config: Arc::new(Mutex::new(block_engine_config)),
+        tip_manager_config,
+        shred_receiver_address: Arc::new(RwLock::new(
+            matches
+                .value_of("shred_receiver_address")
+                .map(|addr| SocketAddr::from_str(addr).expect("shred_receiver_address invalid")),
+        )),
         staked_nodes_overrides: staked_nodes_overrides.clone(),
         replay_slots_concurrently: matches.is_present("replay_slots_concurrently"),
         use_snapshot_archives_at_startup: value_t_or_exit!(
@@ -2094,5 +2103,49 @@ fn process_account_indexes(matches: &ArgMatches) -> AccountSecondaryIndexes {
     AccountSecondaryIndexes {
         keys,
         indexes: account_indexes,
+    }
+}
+
+fn tip_manager_config_from_matches(
+    matches: &ArgMatches,
+    voting_disabled: bool,
+) -> TipManagerConfig {
+    TipManagerConfig {
+        tip_payment_program_id: pubkey_of(matches, "tip_payment_program_pubkey").unwrap_or_else(
+            || {
+                if !voting_disabled {
+                    panic!("--tip-payment-program-pubkey argument required when validator is voting");
+                }
+                Pubkey::new_unique()
+            },
+        ),
+        tip_distribution_program_id: pubkey_of(matches, "tip_distribution_program_pubkey")
+            .unwrap_or_else(|| {
+                if !voting_disabled {
+                    panic!("--tip-distribution-program-pubkey argument required when validator is voting");
+                }
+                Pubkey::new_unique()
+            }),
+        tip_distribution_account_config: TipDistributionAccountConfig {
+            merkle_root_upload_authority: pubkey_of(matches, "merkle_root_upload_authority")
+                .unwrap_or_else(|| {
+                    if !voting_disabled {
+                        panic!("--merkle-root-upload-authority argument required when validator is voting");
+                    }
+                    Pubkey::new_unique()
+                }),
+            vote_account: pubkey_of(matches, "vote_account").unwrap_or_else(|| {
+                if !voting_disabled {
+                    panic!("--vote-account argument required when validator is voting");
+                }
+                Pubkey::new_unique()
+            }),
+            commission_bps: value_t!(matches, "commission_bps", u16).unwrap_or_else(|_| {
+                if !voting_disabled {
+                    panic!("--commission-bps argument required when validator is voting");
+                }
+                0
+            }),
+        },
     }
 }

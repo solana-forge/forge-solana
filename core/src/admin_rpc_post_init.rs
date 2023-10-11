@@ -1,10 +1,12 @@
 use {
+    crate::proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
     solana_gossip::cluster_info::ClusterInfo,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::pubkey::Pubkey,
     std::{
         collections::HashSet,
-        sync::{Arc, RwLock},
+        net::SocketAddr,
+        sync::{Arc, Mutex, RwLock},
     },
 };
 

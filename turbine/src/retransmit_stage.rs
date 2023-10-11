@@ -317,12 +317,13 @@ fn retransmit_shred(
     socket: &UdpSocket,
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     stats: &RetransmitStats,
+    shred_receiver_addr: &Option<SocketAddr>,
 ) -> Result<(/*root_distance:*/ usize, /*num_nodes:*/ usize), Error> {
     let mut compute_turbine_peers = Measure::start("turbine_start");
     let data_plane_fanout = cluster_nodes::get_data_plane_fanout(key.slot(), root_bank);
     let (root_distance, addrs) =
         cluster_nodes.get_retransmit_addrs(slot_leader, key, data_plane_fanout)?;
-    let addrs: Vec<_> = addrs
+    let mut addrs: Vec<_> = addrs
         .into_iter()
         .filter(|addr| socket_addr_space.check(addr))
         .collect();
@@ -386,6 +387,7 @@ pub fn retransmitter(
     shreds_receiver: Receiver<Vec</*shred:*/ Vec<u8>>>,
     max_slots: Arc<MaxSlots>,
     rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
+    shred_receiver_addr: Arc<RwLock<Option<SocketAddr>>>,
 ) -> JoinHandle<()> {
     let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
         CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
@@ -417,6 +419,7 @@ pub fn retransmitter(
                 &mut shred_deduper,
                 &max_slots,
                 rpc_subscriptions.as_deref(),
+                &shred_receiver_addr,
             ) {
                 Ok(()) => (),
                 Err(RecvTimeoutError::Timeout) => (),
@@ -440,6 +443,7 @@ impl RetransmitStage {
         retransmit_receiver: Receiver<Vec</*shred:*/ Vec<u8>>>,
         max_slots: Arc<MaxSlots>,
         rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
+        shred_receiver_addr: Arc<RwLock<Option<SocketAddr>>>,
     ) -> Self {
         let retransmit_thread_handle = retransmitter(
             retransmit_sockets,
@@ -450,6 +454,7 @@ impl RetransmitStage {
             retransmit_receiver,
             max_slots,
             rpc_subscriptions,
+            shred_receiver_addr,
         );
 
         Self {

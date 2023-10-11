@@ -17,6 +17,7 @@ use {
         ledger_metric_report_service::LedgerMetricReportService,
         pbs::pbs_stage::PbsConfig,
         poh_timing_report_service::PohTimingReportService,
+        proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
         repair::{self, serve_repair::ServeRepair, serve_repair_service::ServeRepairService},
         rewards_recorder_service::{RewardsRecorderSender, RewardsRecorderService},
         sample_performance_service::SamplePerformanceService,
@@ -26,6 +27,7 @@ use {
         system_monitor_service::{
             verify_net_stats_access, SystemMonitorService, SystemMonitorStatsReportConfig,
         },
+        tip_manager::TipManagerConfig,
         tpu::{Tpu, TpuSockets, DEFAULT_TPU_COALESCE},
         tvu::{Tvu, TvuConfig, TvuSockets},
     },

@@ -108,6 +108,7 @@ impl BroadcastStageType {
         bank_forks: Arc<RwLock<BankForks>>,
         shred_version: u16,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
+        shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
@@ -120,6 +121,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 StandardBroadcastRun::new(shred_version),
+                shred_receiver_address,
             ),
 
             BroadcastStageType::FailEntryVerification => BroadcastStage::new(
@@ -132,6 +134,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 FailEntryVerificationBroadcastRun::new(shred_version),
+                Arc::new(RwLock::new(None)),
             ),
 
             BroadcastStageType::BroadcastFakeShreds => BroadcastStage::new(
@@ -144,6 +147,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 BroadcastFakeShredsRun::new(0, shred_version),
+                Arc::new(RwLock::new(None)),
             ),
 
             BroadcastStageType::BroadcastDuplicates(config) => BroadcastStage::new(
@@ -156,6 +160,7 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 BroadcastDuplicatesRun::new(shred_version, config.clone()),
+                Arc::new(RwLock::new(None)),
             ),
         }
     }
@@ -177,6 +182,7 @@ trait BroadcastRun {
         sock: &UdpSocket,
         bank_forks: &RwLock<BankForks>,
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+        shred_receiver_address: &Arc<RwLock<Option<SocketAddr>>>,
     ) -> Result<()>;
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()>;
 }
@@ -272,6 +278,7 @@ impl BroadcastStage {
         bank_forks: Arc<RwLock<BankForks>>,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         broadcast_stage_run: impl BroadcastRun + Send + 'static + Clone,
+        shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     ) -> Self {
         let (socket_sender, socket_receiver) = unbounded();
         let (blockstore_sender, blockstore_receiver) = unbounded();
@@ -311,6 +318,7 @@ impl BroadcastStage {
                     &sock,
                     &bank_forks,
                     &quic_endpoint_sender,
+                    &shred_receiver_address,
                 );
                 let res = Self::handle_error(res, "solana-broadcaster-transmit");
                 if let Some(res) = res {
@@ -432,6 +440,7 @@ pub fn broadcast_shreds(
     bank_forks: &RwLock<BankForks>,
     socket_addr_space: &SocketAddrSpace,
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+    shred_receiver_address: &Option<SocketAddr>,
 ) -> Result<()> {
     let mut result = Ok(());
     let mut shred_select = Measure::start("shred_select");

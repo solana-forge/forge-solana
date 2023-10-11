@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "jito-protos"
-version = "1.17.18"
+version = "1.17.24"
 dependencies = [
  "bytes",
  "prost",
@@ -4898,6 +4898,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-bundle"
+version = "1.17.24"
+dependencies = [
+ "anchor-lang",
+ "itertools",
+ "log",
+ "serde",
+ "solana-accounts-db",
+ "solana-ledger",
+ "solana-logger",
+ "solana-measure",
+ "solana-poh",
+ "solana-program-runtime",
+ "solana-runtime",
+ "solana-sdk",
+ "solana-transaction-status",
+ "thiserror",
+]
+
+[[package]]
 name = "solana-clap-utils"
 version = "1.17.24"
 dependencies = [
@@ -5874,6 +5894,24 @@ dependencies = [
  "tempfile",
  "thiserror",
  "zstd",
+]
+
+[[package]]
+name = "solana-runtime-plugin"
+version = "1.17.24"
+dependencies = [
+ "crossbeam-channel",
+ "json5",
+ "jsonrpc-core",
+ "jsonrpc-core-client",
+ "jsonrpc-derive",
+ "jsonrpc-ipc-server",
+ "jsonrpc-server-utils",
+ "libloading",
+ "log",
+ "solana-runtime",
+ "solana-sdk",
+ "thiserror",
 ]
 
 [[package]]

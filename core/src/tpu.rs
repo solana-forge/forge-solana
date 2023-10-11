@@ -16,6 +16,7 @@ use {
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
+        tip_manager::{TipManager, TipManagerConfig},
         tpu_entry_notifier::TpuEntryNotifier,
         validator::{BlockProductionMethod, GeneratorConfig},
     },
@@ -33,7 +34,7 @@ use {
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache},
-    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Keypair},
+    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Keypair, signer::Signer},
     solana_streamer::{
         nonblocking::quic::DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
         quic::{spawn_server, MAX_STAKED_CONNECTIONS, MAX_UNSTAKED_CONNECTIONS},
@@ -142,7 +143,7 @@ impl Tpu {
             tpu_forwards_sockets,
             tpu_vote_sockets,
             exit.clone(),
-            &packet_sender,
+            &packet_intercept_sender,
             &vote_packet_sender,
             &forwarded_packet_sender,
             forwarded_packet_receiver,
@@ -171,7 +172,7 @@ impl Tpu {
                 .tpu(Protocol::QUIC)
                 .expect("Operator must spin up node with valid (QUIC) TPU address")
                 .ip(),
-            packet_sender,
+            packet_intercept_sender,
             exit.clone(),
             MAX_QUIC_CONNECTIONS_PER_PEER,
             staked_nodes.clone(),
@@ -201,6 +202,8 @@ impl Tpu {
             tpu_coalesce,
         )
         .unwrap();
+
+        let (packet_sender, packet_receiver) = unbounded();
 
         let sigverify_stage = {
             let verifier = TransactionSigVerifier::new(pbs_sender.clone());
