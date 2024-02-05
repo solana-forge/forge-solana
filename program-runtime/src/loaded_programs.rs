@@ -193,7 +193,7 @@ impl Stats {
             ("reloads", reloads, i64),
             ("insertions", insertions, i64),
             ("lost_insertions", lost_insertions, i64),
-            ("replace_entry", replacements, i64),
+            ("replacements", replacements, i64),
             ("one_hit_wonders", one_hit_wonders, i64),
             ("prunes_orphan", prunes_orphan, i64),
             ("prunes_environment", prunes_environment, i64),
@@ -653,16 +653,15 @@ impl<FG: ForkGraph> LoadedPrograms<FG> {
         entry: Arc<LoadedProgram>,
     ) -> (bool, Arc<LoadedProgram>) {
         let slot_versions = &mut self.entries.entry(key).or_default().slot_versions;
-        match slot_versions.binary_search_by(|at| {
-            at.effective_slot
-                .cmp(&entry.effective_slot)
-                .then(at.deployment_slot.cmp(&entry.deployment_slot))
-        }) {
-            Ok(index) => {
-                let existing = slot_versions.get_mut(index).unwrap();
-                if std::mem::discriminant(&existing.program)
-                    != std::mem::discriminant(&entry.program)
-                {
+        let index = slot_versions
+            .iter()
+            .position(|at| at.effective_slot >= entry.effective_slot);
+        if let Some(existing) = index.and_then(|index| slot_versions.get_mut(index)) {
+            if existing.deployment_slot == entry.deployment_slot
+                && existing.effective_slot == entry.effective_slot
+            {
+                if matches!(existing.program, LoadedProgramType::Unloaded(_)) {
+                    // The unloaded program is getting reloaded
                     // Copy over the usage counter to the new entry
                     entry.tx_usage_counter.fetch_add(
                         existing.tx_usage_counter.load(Ordering::Relaxed),
@@ -673,13 +672,19 @@ impl<FG: ForkGraph> LoadedPrograms<FG> {
                         Ordering::Relaxed,
                     );
                     self.stats.reloads.fetch_add(1, Ordering::Relaxed);
-                    *existing = entry.clone();
-                    (false, entry)
+                } else if existing.is_tombstone() != entry.is_tombstone() {
+                    // Either the old entry is tombstone and the new one is not.
+                    // (Let's give the new entry a chance).
+                    // Or, the old entry is not a tombstone and the new one is a tombstone.
+                    // (Remove the old entry, as the tombstone makes it obsolete).
+                    self.stats.insertions.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // Something is wrong, I can feel it ...
                     self.stats.replacements.fetch_add(1, Ordering::Relaxed);
                     (true, existing.clone())
                 }
+                *existing = entry.clone();
+                return (false, entry);
             }
             Err(index) => {
                 self.stats.insertions.fetch_add(1, Ordering::Relaxed);
@@ -969,7 +974,7 @@ impl<FG: ForkGraph> LoadedPrograms<FG> {
         {
             self.stats.lost_insertions.fetch_add(1, Ordering::Relaxed);
         }
-        let (was_replaced, _) = self.assign_program(key, loaded_program);
+        self.assign_program(key, loaded_program);
         self.loading_task_waiter.notify();
         was_replaced
     }
