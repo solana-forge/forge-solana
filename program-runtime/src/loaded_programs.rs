@@ -193,7 +193,7 @@ impl Stats {
             ("reloads", reloads, i64),
             ("insertions", insertions, i64),
             ("lost_insertions", lost_insertions, i64),
-            ("replacements", replacements, i64),
+            ("replace_entry", replacements, i64),
             ("one_hit_wonders", one_hit_wonders, i64),
             ("prunes_orphan", prunes_orphan, i64),
             ("prunes_environment", prunes_environment, i64),
@@ -738,7 +738,7 @@ impl<FG: ForkGraph> LoadedPrograms<FG> {
         key: Pubkey,
         entry: Arc<LoadedProgram>,
         current_slot: Slot,
-    ) -> Arc<LoadedProgram> {
+    ) -> (bool, Arc<LoadedProgram>) {
         let (was_occupied, entry) = self.replenish(key, entry, current_slot);
         debug_assert!(!was_occupied);
         (was_occupied, entry)
@@ -1010,7 +1010,7 @@ impl<FG: ForkGraph> LoadedPrograms<FG> {
         {
             self.stats.lost_insertions.fetch_add(1, Ordering::Relaxed);
         }
-        self.assign_program(key, loaded_program, slot);
+        let (was_replaced, _) = self.assign_program(key, loaded_program, slot);
         self.loading_task_waiter.notify();
         was_replaced
     }
@@ -1235,11 +1235,13 @@ mod tests {
         slot: Slot,
         reason: LoadedProgramType,
     ) -> Arc<LoadedProgram> {
-        cache.assign_program(
-            key,
-            Arc::new(LoadedProgram::new_tombstone(slot, reason)),
-            u64::MAX,
-        )
+        cache
+            .assign_program(
+                key,
+                Arc::new(LoadedProgram::new_tombstone(slot, reason)),
+                u64::MAX,
+            )
+            .1
     }
 
     fn insert_unloaded_program<FG: ForkGraph>(
