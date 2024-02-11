@@ -1489,7 +1489,7 @@ impl Bank {
                     drop(loaded_programs_cache);
                     let recompiled = new.load_program(&key, false, Some(program_to_recompile));
                     let mut loaded_programs_cache = new.loaded_programs_cache.write().unwrap();
-                    loaded_programs_cache.replenish(key, recompiled);
+                    loaded_programs_cache.replenish(key, recompiled, new.slot());
                 }
             } else if new.epoch() != loaded_programs_cache.latest_root_epoch
                 || slot_index.saturating_add(slots_in_recompilation_phase) >= slots_in_epoch
@@ -4439,6 +4439,7 @@ impl Bank {
             &mut timings,
             Some(&account_overrides),
             None,
+            true,
         );
 
         let post_simulation_accounts = loaded_transactions
@@ -5131,6 +5132,7 @@ impl Bank {
     fn replenish_program_cache(
         &self,
         program_accounts_map: &HashMap<Pubkey, (&Pubkey, u64)>,
+        limit_to_load_programs: bool,
     ) -> LoadedProgramsForTxBatch {
         let mut missing_programs: Vec<(Pubkey, (LoadedProgramMatchCriteria, u64))> =
             if self.check_program_modification_slot {
@@ -5176,11 +5178,16 @@ impl Bank {
                 }
                 // Submit our last completed loading task.
                 if let Some((key, program)) = program_to_store.take() {
-                    loaded_programs_cache.finish_cooperative_loading_task(
+                    if loaded_programs_cache.finish_cooperative_loading_task(
                         self.slot(),
                         key,
                         program,
-                    );
+                    ) && limit_to_load_programs
+                    {
+                        let mut ret = LoadedProgramsForTxBatch::default();
+                        ret.hit_max_limit = true;
+                        return ret;
+                    }
                 }
                 // Figure out which program needs to be loaded next.
                 let program_to_load = loaded_programs_cache.extract(
@@ -5212,7 +5219,7 @@ impl Bank {
         loaded_programs_for_txs.unwrap()
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn load_and_execute_transactions(
         &self,
         batch: &TransactionBatch,
@@ -5223,6 +5230,7 @@ impl Bank {
         timings: &mut ExecuteTimings,
         account_overrides: Option<&AccountOverrides>,
         log_messages_bytes_limit: Option<usize>,
+        limit_to_load_programs: bool,
     ) -> LoadAndExecuteTransactionsOutput {
         let sanitized_txs = batch.sanitized_transactions();
         debug!("processing transactions: {}", sanitized_txs.len());
@@ -5292,8 +5300,21 @@ impl Bank {
         }
 
         let programs_loaded_for_tx_batch = Rc::new(RefCell::new(
-            self.replenish_program_cache(&program_accounts_map),
+            self.replenish_program_cache(&program_accounts_map, limit_to_load_programs),
         ));
+
+        if programs_loaded_for_tx_batch.borrow().hit_max_limit {
+            return LoadAndExecuteTransactionsOutput {
+                loaded_transactions: vec![],
+                execution_results: vec![],
+                retryable_transaction_indexes: vec![],
+                executed_transactions_count: 0,
+                executed_non_vote_transactions_count: 0,
+                executed_with_successful_result_count: 0,
+                signature_count: 0,
+                error_counters,
+            };
+        }
 
         let mut load_time = Measure::start("accounts_load");
         let mut loaded_transactions = self.rc.accounts.load_accounts(
@@ -6413,6 +6434,7 @@ impl Bank {
             timings,
             None,
             log_messages_bytes_limit,
+            false,
         );
 
         let (last_blockhash, lamports_per_signature) =
@@ -7876,10 +7898,11 @@ impl Bank {
         debug!("Adding program {} under {:?}", name, program_id);
         self.add_builtin_account(name.as_str(), &program_id, false);
         self.builtin_programs.insert(program_id);
-        self.loaded_programs_cache
-            .write()
-            .unwrap()
-            .replenish(program_id, Arc::new(builtin));
+        self.loaded_programs_cache.write().unwrap().replenish(
+            program_id,
+            Arc::new(builtin),
+            self.slot,
+        );
         debug!("Added program {} under {:?}", name, program_id);
     }
 
