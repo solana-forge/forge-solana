@@ -1261,11 +1261,6 @@ impl BundleStorage {
                         debug!("bundle={} exceeds cost model", sanitized_bundle.bundle_id);
                         self.push_back_cost_model_buffered_bundles(vec![deserialized_bundle]);
                     }
-                    Err(BundleExecutionError::TipError(e)) => {
-                        debug!("bundle={} tip error: {}", sanitized_bundle.bundle_id, e);
-                        // Tip errors are _typically_ due to misconfiguration (except for poh record error, bank processing error, exceeds cost model)
-                        // in order to prevent buffering too many bundles, we'll just drop the bundle
-                    }
                     Err(BundleExecutionError::LockError) => {
                         // lock errors are irrecoverable due to malformed transactions
                         debug!("bundle={} lock error", sanitized_bundle.bundle_id);

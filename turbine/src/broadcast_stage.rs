@@ -108,7 +108,6 @@ impl BroadcastStageType {
         bank_forks: Arc<RwLock<BankForks>>,
         shred_version: u16,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
-        shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
@@ -121,7 +120,6 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 StandardBroadcastRun::new(shred_version),
-                shred_receiver_address,
             ),
 
             BroadcastStageType::FailEntryVerification => BroadcastStage::new(
@@ -134,7 +132,6 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 FailEntryVerificationBroadcastRun::new(shred_version),
-                Arc::new(RwLock::new(None)),
             ),
 
             BroadcastStageType::BroadcastFakeShreds => BroadcastStage::new(
@@ -147,7 +144,6 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 BroadcastFakeShredsRun::new(0, shred_version),
-                Arc::new(RwLock::new(None)),
             ),
 
             BroadcastStageType::BroadcastDuplicates(config) => BroadcastStage::new(
@@ -160,7 +156,6 @@ impl BroadcastStageType {
                 bank_forks,
                 quic_endpoint_sender,
                 BroadcastDuplicatesRun::new(shred_version, config.clone()),
-                Arc::new(RwLock::new(None)),
             ),
         }
     }
@@ -182,7 +177,6 @@ trait BroadcastRun {
         sock: &UdpSocket,
         bank_forks: &RwLock<BankForks>,
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
-        shred_receiver_address: &Arc<RwLock<Option<SocketAddr>>>,
     ) -> Result<()>;
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()>;
 }
@@ -278,7 +272,6 @@ impl BroadcastStage {
         bank_forks: Arc<RwLock<BankForks>>,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         broadcast_stage_run: impl BroadcastRun + Send + 'static + Clone,
-        shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     ) -> Self {
         let (socket_sender, socket_receiver) = unbounded();
         let (blockstore_sender, blockstore_receiver) = unbounded();
@@ -310,7 +303,6 @@ impl BroadcastStage {
             let cluster_info = cluster_info.clone();
             let bank_forks = bank_forks.clone();
             let quic_endpoint_sender = quic_endpoint_sender.clone();
-            let shred_receiver_address = shred_receiver_address.clone();
 
             let run_transmit = move || loop {
                 let res = bs_transmit.transmit(
@@ -319,7 +311,6 @@ impl BroadcastStage {
                     &sock,
                     &bank_forks,
                     &quic_endpoint_sender,
-                    &shred_receiver_address,
                 );
                 let res = Self::handle_error(res, "solana-broadcaster-transmit");
                 if let Some(res) = res {
@@ -441,7 +432,6 @@ pub fn broadcast_shreds(
     bank_forks: &RwLock<BankForks>,
     socket_addr_space: &SocketAddrSpace,
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
-    shred_receiver_address: &Option<SocketAddr>,
 ) -> Result<()> {
     let mut result = Ok(());
     let mut shred_select = Measure::start("shred_select");
@@ -462,10 +452,10 @@ pub fn broadcast_shreds(
                 let protocol = cluster_nodes::get_broadcast_protocol(&key);
 
                 let mut addrs = Vec::with_capacity(2);
-                if let Some(shred_receiver_address) = shred_receiver_address {
-                    // Assuming always over UDP for shred_receiver_address
-                    addrs.push((Protocol::UDP, *shred_receiver_address));
-                }
+                // if let Some(shred_receiver_address) = shred_receiver_address {
+                //     // Assuming always over UDP for shred_receiver_address
+                //     addrs.push((Protocol::UDP, *shred_receiver_address));
+                // }
                 if let Some(peer) = cluster_nodes.get_broadcast_peer(&key) {
                     match protocol {
                         Protocol::QUIC => {

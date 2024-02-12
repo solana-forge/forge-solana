@@ -1,5 +1,5 @@
 [package]
-name = "jito-protos"
+name = "forge-protos"
 version = { workspace = true }
 edition = { workspace = true }
 publish = false

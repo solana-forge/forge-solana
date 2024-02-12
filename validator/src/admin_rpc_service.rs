@@ -13,10 +13,6 @@ use {
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
         consensus::{tower_storage::TowerStorage, Tower},
-        proxy::{
-            block_engine_stage::{BlockEngineConfig, BlockEngineStage},
-            relayer_stage::{RelayerConfig, RelayerStage},
-        },
         validator::ValidatorStartProgress,
     },
     solana_geyser_plugin_manager::GeyserPluginManagerRequest,
@@ -464,21 +460,22 @@ impl AdminRpc for AdminRpcImpl {
         trust_packets: bool,
     ) -> Result<()> {
         debug!("set_block_engine_config request received");
-        let config = BlockEngineConfig {
-            block_engine_url,
-            trust_packets,
-        };
+        // let config = BlockEngineConfig {
+        //     block_engine_url,
+        //     trust_packets,
+        // };
         // Detailed log messages are printed inside validate function
-        if BlockEngineStage::is_valid_block_engine_config(&config) {
-            meta.with_post_init(|post_init| {
-                *post_init.block_engine_config.lock().unwrap() = config;
-                Ok(())
-            })
-        } else {
-            Err(jsonrpc_core::error::Error::invalid_params(
-                "failed to set block engine config. see logs for details.",
-            ))
-        }
+        // if BlockEngineStage::is_valid_block_engine_config(&config) {
+        //     meta.with_post_init(|post_init| {
+        //         // *post_init.block_engine_config.lock().unwrap() = config;
+        //         Ok(())
+        //     })
+        // } else {
+        //     Err(jsonrpc_core::error::Error::invalid_params(
+        //         "failed to set block engine config. see logs for details.",
+        //     ))
+        // }
+        Ok(())
     }
 
     fn set_identity(
@@ -523,27 +520,28 @@ impl AdminRpc for AdminRpcImpl {
         expected_heartbeat_interval_ms: u64,
         max_failed_heartbeats: u64,
     ) -> Result<()> {
-        debug!("set_relayer_config request received");
-        let expected_heartbeat_interval = Duration::from_millis(expected_heartbeat_interval_ms);
-        let oldest_allowed_heartbeat =
-            Duration::from_millis(max_failed_heartbeats * expected_heartbeat_interval_ms);
-        let config = RelayerConfig {
-            relayer_url,
-            expected_heartbeat_interval,
-            oldest_allowed_heartbeat,
-            trust_packets,
-        };
-        // Detailed log messages are printed inside validate function
-        if RelayerStage::is_valid_relayer_config(&config) {
-            meta.with_post_init(|post_init| {
-                *post_init.relayer_config.lock().unwrap() = config;
-                Ok(())
-            })
-        } else {
-            Err(jsonrpc_core::error::Error::invalid_params(
-                "failed to set relayer config. see logs for details.",
-            ))
-        }
+        // debug!("set_relayer_config request received");
+        // let expected_heartbeat_interval = Duration::from_millis(expected_heartbeat_interval_ms);
+        // let oldest_allowed_heartbeat =
+        //     Duration::from_millis(max_failed_heartbeats * expected_heartbeat_interval_ms);
+        // let config = RelayerConfig {
+        //     relayer_url,
+        //     expected_heartbeat_interval,
+        //     oldest_allowed_heartbeat,
+        //     trust_packets,
+        // };
+        // // Detailed log messages are printed inside validate function
+        // if RelayerStage::is_valid_relayer_config(&config) {
+        //     meta.with_post_init(|post_init| {
+        //         // *post_init.relayer_config.lock().unwrap() = config;
+        //         Ok(())
+        //     })
+        // } else {
+        //     Err(jsonrpc_core::error::Error::invalid_params(
+        //         "failed to set relayer config. see logs for details.",
+        //     ))
+        // }
+        Ok(())
     }
 
     fn set_shred_receiver_address(&self, meta: Self::Metadata, addr: String) -> Result<()> {
@@ -559,7 +557,7 @@ impl AdminRpc for AdminRpcImpl {
         };
 
         meta.with_post_init(|post_init| {
-            *post_init.shred_receiver_address.write().unwrap() = shred_receiver_address;
+            // *post_init.shred_receiver_address.write().unwrap() = shred_receiver_address;
             Ok(())
         })
     }
@@ -993,9 +991,7 @@ mod tests {
                     bank_forks: bank_forks.clone(),
                     vote_account,
                     repair_whitelist,
-                    block_engine_config,
-                    relayer_config,
-                    shred_receiver_address,
+                    // shred_receiver_address,
                 }))),
                 staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
                 rpc_to_plugin_manager_sender: None,

@@ -8,14 +8,7 @@ fn main() -> Result<(), std::io::Error> {
     }
 
     let proto_base_path = std::path::PathBuf::from("protos");
-    let proto_files = [
-        "auth.proto",
-        "block_engine.proto",
-        "bundle.proto",
-        "packet.proto",
-        "relayer.proto",
-        "shared.proto",
-    ];
+    let proto_files = ["pbs.proto", "bundle.proto", "packet.proto"];
     let mut protos = Vec::new();
     for proto_file in &proto_files {
         let proto = proto_base_path.join(proto_file);
@@ -26,13 +19,5 @@ fn main() -> Result<(), std::io::Error> {
     configure()
         .build_client(true)
         .build_server(false)
-        .type_attribute(
-            "TransactionErrorType",
-            "#[cfg_attr(test, derive(enum_iterator::Sequence))]",
-        )
-        .type_attribute(
-            "InstructionErrorType",
-            "#[cfg_attr(test, derive(enum_iterator::Sequence))]",
-        )
         .compile(&protos, &[proto_base_path])
 }

@@ -63,7 +63,7 @@ impl Default for Version {
             commit: compute_commit(option_env!("CI_COMMIT")).unwrap_or_default(),
             feature_set,
             // Other client implementations need to modify this line.
-            client: u16::try_from(ClientId::JitoLabs).unwrap(),
+            client: u16::try_from(ClientId::SolanaLabs).unwrap(),
         }
     }
 }
@@ -153,7 +153,7 @@ mod test {
         assert_eq!(u16::try_from(ClientId::SolanaLabs), Ok(0u16));
         assert_eq!(u16::try_from(ClientId::JitoLabs), Ok(1u16));
         assert_eq!(u16::try_from(ClientId::Firedancer), Ok(2u16));
-        for client in 0..=2u16 {
+        for client in 0..=3u16 {
             assert_eq!(
                 u16::try_from(ClientId::Unknown(client)),
                 Err(format!("Invalid client: {client}"))

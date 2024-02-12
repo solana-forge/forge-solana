@@ -78,6 +78,7 @@ pub enum ChannelLabel {
     TpuVote,
     GossipVote,
     Dummy,
+    PbsNonVote,
 }
 
 struct RollingConditionGrouped {
@@ -220,6 +221,10 @@ impl BankingTracer {
 
     pub fn create_channel_non_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {
         self.create_channel(ChannelLabel::NonVote)
+    }
+
+    pub fn create_channel_pbs(&self) -> (BankingPacketSender, BankingPacketReceiver) {
+        self.create_channel(ChannelLabel::PbsNonVote)
     }
 
     pub fn create_channel_tpu_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {

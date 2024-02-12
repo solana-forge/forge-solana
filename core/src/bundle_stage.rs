@@ -14,8 +14,6 @@ use {
             bundle_stage_leader_metrics::BundleStageLeaderMetrics, committer::Committer,
         },
         packet_bundle::PacketBundle,
-        proxy::block_engine_stage::BlockBuilderFeeInfo,
-        tip_manager::TipManager,
     },
     crossbeam_channel::{Receiver, RecvTimeoutError},
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
@@ -30,7 +28,7 @@ use {
         collections::VecDeque,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex, RwLock,
+            Arc, RwLock,
         },
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -205,9 +203,7 @@ impl BundleStage {
         replay_vote_sender: ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
         exit: Arc<AtomicBool>,
-        tip_manager: TipManager,
         bundle_account_locker: BundleAccountLocker,
-        block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         preallocated_bundle_cost: u64,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
@@ -220,10 +216,8 @@ impl BundleStage {
             replay_vote_sender,
             log_messages_bytes_limit,
             exit,
-            tip_manager,
             bundle_account_locker,
             MAX_BUNDLE_RETRY_DURATION,
-            block_builder_fee_info,
             preallocated_bundle_cost,
             bank_forks,
             prioritization_fee_cache,
@@ -243,10 +237,8 @@ impl BundleStage {
         replay_vote_sender: ReplayVoteSender,
         log_message_bytes_limit: Option<usize>,
         exit: Arc<AtomicBool>,
-        tip_manager: TipManager,
         bundle_account_locker: BundleAccountLocker,
         max_bundle_retry_duration: Duration,
-        block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         preallocated_bundle_cost: u64,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
@@ -290,9 +282,7 @@ impl BundleStage {
             poh_recorder.read().unwrap().new_recorder(),
             QosService::new(BUNDLE_STAGE_ID),
             log_message_bytes_limit,
-            tip_manager,
             bundle_account_locker,
-            block_builder_fee_info.clone(),
             max_bundle_retry_duration,
             cluster_info,
             reserved_space,
@@ -420,7 +410,7 @@ impl BundleStage {
                     unprocessed_bundle_storage.bundle_storage().unwrap().reset();
 
                 // TODO (LB): add metrics here for how many bundles were cleared
-
+                info!("bundle cleared {}", _num_bundles_cleared);
                 bundle_stage_leader_metrics
                     .apply_action(metrics_action, banking_stage_metrics_action);
             }

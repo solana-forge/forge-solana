@@ -14,7 +14,6 @@ edition = { workspace = true }
 codecov = { repository = "solana-labs/solana", branch = "master", service = "github" }
 
 [dependencies]
-anchor-lang = { workspace = true }
 base64 = { workspace = true }
 bincode = { workspace = true }
 bs58 = { workspace = true }
@@ -24,12 +23,10 @@ crossbeam-channel = { workspace = true }
 dashmap = { workspace = true, features = ["rayon", "raw-api"] }
 eager = { workspace = true }
 etcd-client = { workspace = true, features = ["tls"] }
+forge-protos = { workspace = true }
 futures = { workspace = true }
 histogram = { workspace = true }
 itertools = { workspace = true }
-jito-protos = { workspace = true }
-jito-tip-distribution = { workspace = true }
-jito-tip-payment = { workspace = true }
 lazy_static = { workspace = true }
 log = { workspace = true }
 lru = { workspace = true }
@@ -47,6 +44,7 @@ rustls = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_derive = { workspace = true }
+serde_json = { workspace = true }
 solana-accounts-db = { workspace = true }
 solana-bloom = { workspace = true }
 solana-bundle = { workspace = true }
@@ -85,8 +83,11 @@ sys-info = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 trees = { workspace = true }
+reqwest = { workspace = true, features = ["brotli", "deflate", "gzip", "rustls-tls"] }
+tokio-util = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 assert_matches = { workspace = true }

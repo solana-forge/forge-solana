@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+import "packet.proto";
+import "google/protobuf/timestamp.proto";
+
+package bundle;
+
+message Bundle {
+  string uuid = 1;
+  repeated packet.Packet packets = 2;
+}

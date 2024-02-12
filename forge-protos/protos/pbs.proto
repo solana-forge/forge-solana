@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+import "packet.proto";
+import "bundle.proto";
+
+package pbs;
+
+message PacketBatchRequest {
+  google.protobuf.Timestamp ts = 1;
+  repeated packet.PacketBatch packet_batches = 2;
+}
+
+message BundlesResponse {
+  google.protobuf.Timestamp ts = 1;
+  repeated bundle.Bundle bundles = 2;
+}
+
+message SanitizedTransaction {
+  // bincode serialized versioned_transaction
+  bytes versioned_transaction = 1;
+  bytes message_hash = 2;
+  // is_simple_vote_tx always == false
+  // bincode serialized LoadedAddress
+  bytes loaded_addresses = 3;
+}
+
+message SanitizedTransactionRequest {
+  google.protobuf.Timestamp ts = 1;
+  repeated SanitizedTransaction transactions = 2;
+}
+
+/// Validators can connect to PBS to send packets and receive and bundles.
+service PbsValidator {
+  rpc SubscribeSanitized (stream SanitizedTransactionRequest) returns (stream BundlesResponse) {}
+}

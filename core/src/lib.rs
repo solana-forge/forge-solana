@@ -30,9 +30,9 @@ pub mod ledger_metric_report_service;
 pub mod next_leader;
 pub mod optimistic_confirmation_verifier;
 pub mod packet_bundle;
+pub mod pbs;
 pub mod poh_timing_report_service;
 pub mod poh_timing_reporter;
-pub mod proxy;
 pub mod repair;
 pub mod replay_stage;
 mod result;
@@ -45,7 +45,6 @@ pub mod snapshot_packager_service;
 pub mod staked_nodes_updater_service;
 pub mod stats_reporter_service;
 pub mod system_monitor_service;
-pub mod tip_manager;
 pub mod tpu;
 mod tpu_entry_notifier;
 pub mod tracer_packet_stats;
@@ -78,6 +77,9 @@ extern crate solana_frozen_abi_macro;
 extern crate assert_matches;
 
 use {
+    forge_protos::proto::packet::{
+        Meta as ProtoMeta, Packet as ProtoPacket, PacketFlags as ProtoPacketFlags,
+    },
     solana_sdk::packet::{Meta, Packet, PacketFlags, PACKET_DATA_SIZE},
     std::{
         cmp::min,
@@ -88,7 +90,7 @@ use {
 const UNKNOWN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
 
 // NOTE: last profiled at around 180ns
-pub fn proto_packet_to_packet(p: jito_protos::proto::packet::Packet) -> Packet {
+pub fn proto_packet_to_packet(p: ProtoPacket) -> Packet {
     let mut data = [0; PACKET_DATA_SIZE];
     let copy_len = min(data.len(), p.data.len());
     data[..copy_len].copy_from_slice(&p.data[..copy_len]);
@@ -113,4 +115,23 @@ pub fn proto_packet_to_packet(p: jito_protos::proto::packet::Packet) -> Packet {
         }
     }
     packet
+}
+
+pub fn packet_to_proto_packet(p: &Packet) -> Option<ProtoPacket> {
+    Some(ProtoPacket {
+        data: p.data(..)?.to_vec(),
+        meta: Some(ProtoMeta {
+            size: p.meta().size as u64,
+            addr: p.meta().addr.to_string(),
+            port: p.meta().port as u32,
+            flags: Some(ProtoPacketFlags {
+                discard: p.meta().discard(),
+                forwarded: p.meta().forwarded(),
+                repair: p.meta().repair(),
+                simple_vote_tx: p.meta().is_simple_vote_tx(),
+                tracer_packet: p.meta().is_tracer_packet(),
+            }),
+            sender_stake: 0,
+        }),
+    })
 }

@@ -15,8 +15,8 @@ use {
             ExternalRootSource, Tower,
         },
         ledger_metric_report_service::LedgerMetricReportService,
+        pbs::pbs_stage::PbsConfig,
         poh_timing_report_service::PohTimingReportService,
-        proxy::{block_engine_stage::BlockEngineConfig, relayer_stage::RelayerConfig},
         repair::{self, serve_repair::ServeRepair, serve_repair_service::ServeRepairService},
         rewards_recorder_service::{RewardsRecorderSender, RewardsRecorderService},
         sample_performance_service::SamplePerformanceService,
@@ -26,7 +26,6 @@ use {
         system_monitor_service::{
             verify_net_stats_access, SystemMonitorService, SystemMonitorStatsReportConfig,
         },
-        tip_manager::TipManagerConfig,
         tpu::{Tpu, TpuSockets, DEFAULT_TPU_COALESCE},
         tvu::{Tvu, TvuConfig, TvuSockets},
     },
@@ -266,11 +265,9 @@ pub struct ValidatorConfig {
     pub block_production_method: BlockProductionMethod,
     pub generator_config: Option<GeneratorConfig>,
     pub use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup,
-    pub relayer_config: Arc<Mutex<RelayerConfig>>,
-    pub block_engine_config: Arc<Mutex<BlockEngineConfig>>,
+    pub pbs_config: Arc<Mutex<PbsConfig>>,
     // Using Option inside RwLock is ugly, but only convenient way to allow toggle on/off
-    pub shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
-    pub tip_manager_config: TipManagerConfig,
+    // pub shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     pub preallocated_bundle_cost: u64,
 }
 
@@ -340,10 +337,8 @@ impl Default for ValidatorConfig {
             block_production_method: BlockProductionMethod::default(),
             generator_config: None,
             use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
-            relayer_config: Arc::new(Mutex::new(RelayerConfig::default())),
-            block_engine_config: Arc::new(Mutex::new(BlockEngineConfig::default())),
-            shred_receiver_address: Arc::new(RwLock::new(None)),
-            tip_manager_config: TipManagerConfig::default(),
+            pbs_config: Arc::new(Mutex::new(PbsConfig::default())),
+            // shred_receiver_address: Arc::new(RwLock::new(None)),
             preallocated_bundle_cost: u64::default(),
         }
     }
@@ -1040,7 +1035,7 @@ impl Validator {
                     bank_notification_receiver,
                     exit.clone(),
                     bank_forks.clone(),
-                    optimistically_confirmed_bank,
+                    optimistically_confirmed_bank.clone(),
                     rpc_subscriptions.clone(),
                     confirmed_bank_subscribers,
                     prioritization_fee_cache.clone(),
@@ -1113,9 +1108,7 @@ impl Validator {
             cluster_info: cluster_info.clone(),
             vote_account: *vote_account,
             repair_whitelist: config.repair_whitelist.clone(),
-            block_engine_config: config.block_engine_config.clone(),
-            relayer_config: config.relayer_config.clone(),
-            shred_receiver_address: config.shred_receiver_address.clone(),
+            // shred_receiver_address: config.shred_receiver_address.clone(),
         });
 
         let waited_for_supermajority = wait_for_supermajority(
@@ -1310,7 +1303,7 @@ impl Validator {
             turbine_quic_endpoint_sender.clone(),
             turbine_quic_endpoint_receiver,
             repair_quic_endpoint_sender,
-            config.shred_receiver_address.clone(),
+            // config.shred_receiver_address.clone(),
         )?;
 
         let tpu = Tpu::new(
@@ -1354,10 +1347,7 @@ impl Validator {
             &prioritization_fee_cache,
             config.block_production_method.clone(),
             config.generator_config.clone(),
-            config.block_engine_config.clone(),
-            config.relayer_config.clone(),
-            config.tip_manager_config.clone(),
-            config.shred_receiver_address.clone(),
+            config.pbs_config.clone(),
             config.preallocated_bundle_cost,
         );
 

@@ -23,7 +23,6 @@ ignores=(
   .cargo
   target
   node_modules
-  jito-programs
   anchor
 )
 

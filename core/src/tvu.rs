@@ -139,7 +139,6 @@ impl Tvu {
         turbine_quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         turbine_quic_endpoint_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_quic_endpoint_sender: AsyncSender<LocalRequest>,
-        shred_receiver_addr: Arc<RwLock<Option<SocketAddr>>>,
     ) -> Result<Self, String> {
         let TvuSockets {
             repair: repair_socket,
@@ -188,7 +187,6 @@ impl Tvu {
             retransmit_receiver,
             max_slots.clone(),
             Some(rpc_subscriptions.clone()),
-            shred_receiver_addr,
         );
 
         let cluster_slots = Arc::new(ClusterSlots::default());

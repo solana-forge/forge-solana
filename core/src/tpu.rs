@@ -12,15 +12,10 @@ use {
             GossipVerifiedVoteHashSender, VerifiedVoteSender, VoteTracker,
         },
         fetch_stage::FetchStage,
-        proxy::{
-            block_engine_stage::{BlockBuilderFeeInfo, BlockEngineConfig, BlockEngineStage},
-            fetch_stage_manager::FetchStageManager,
-            relayer_stage::{RelayerConfig, RelayerStage},
-        },
+        pbs::pbs_stage::{PbsConfig, PbsEngineStage},
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
-        tip_manager::{TipManager, TipManagerConfig},
         tpu_entry_notifier::TpuEntryNotifier,
         validator::{BlockProductionMethod, GeneratorConfig},
     },
@@ -34,11 +29,13 @@ use {
     },
     solana_poh::poh_recorder::{PohRecorder, WorkingBankEntry},
     solana_rpc::{
-        optimistically_confirmed_bank_tracker::BankNotificationSender,
+        optimistically_confirmed_bank_tracker::{
+            BankNotificationSender,
+        },
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache},
-    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Keypair, signer::Signer},
+    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Keypair},
     solana_streamer::{
         nonblocking::quic::DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
         quic::{spawn_server, MAX_STAKED_CONNECTIONS, MAX_UNSTAKED_CONNECTIONS},
@@ -80,9 +77,10 @@ pub struct Tpu {
     tpu_entry_notifier: Option<TpuEntryNotifier>,
     staked_nodes_updater_service: StakedNodesUpdaterService,
     tracer_thread_hdl: TracerThread,
-    relayer_stage: RelayerStage,
-    block_engine_stage: BlockEngineStage,
-    fetch_stage_manager: FetchStageManager,
+    // relayer_stage: RelayerStage,
+    // block_engine_stage: BlockEngineStage,
+    // fetch_stage_manager: FetchStageManager,
+    pbs_stage: PbsEngineStage,
     bundle_stage: BundleStage,
 }
 
@@ -122,10 +120,7 @@ impl Tpu {
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         block_production_method: BlockProductionMethod,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
-        block_engine_config: Arc<Mutex<BlockEngineConfig>>,
-        relayer_config: Arc<Mutex<RelayerConfig>>,
-        tip_manager_config: TipManagerConfig,
-        shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
+        pbs_config: Arc<Mutex<PbsConfig>>,
         preallocated_bundle_cost: u64,
     ) -> Self {
         let TpuSockets {
@@ -139,16 +134,17 @@ impl Tpu {
 
         // Packets from fetch stage and quic server are intercepted and sent through fetch_stage_manager
         // If relayer is connected, packets are dropped. If not, packets are forwarded on to packet_sender
-        let (packet_intercept_sender, packet_intercept_receiver) = unbounded();
 
+        let (packet_sender, packet_receiver) = unbounded();
         let (vote_packet_sender, vote_packet_receiver) = unbounded();
         let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
+
         let fetch_stage = FetchStage::new_with_sender(
             transactions_sockets,
             tpu_forwards_sockets,
             tpu_vote_sockets,
             exit.clone(),
-            &packet_intercept_sender,
+            &packet_sender,
             &vote_packet_sender,
             &forwarded_packet_sender,
             forwarded_packet_receiver,
@@ -165,6 +161,7 @@ impl Tpu {
             shared_staked_nodes_overrides,
         );
 
+        let (pbs_sender, pbs_receiver) = banking_tracer.create_channel_pbs();
         let (non_vote_sender, non_vote_receiver) = banking_tracer.create_channel_non_vote();
 
         let (_, tpu_quic_t) = spawn_server(
@@ -176,7 +173,7 @@ impl Tpu {
                 .tpu(Protocol::QUIC)
                 .expect("Operator must spin up node with valid (QUIC) TPU address")
                 .ip(),
-            packet_intercept_sender,
+            packet_sender,
             exit.clone(),
             MAX_QUIC_CONNECTIONS_PER_PEER,
             staked_nodes.clone(),
@@ -207,10 +204,8 @@ impl Tpu {
         )
         .unwrap();
 
-        let (packet_sender, packet_receiver) = unbounded();
-
         let sigverify_stage = {
-            let verifier = TransactionSigVerifier::new(non_vote_sender.clone());
+            let verifier = TransactionSigVerifier::new(pbs_sender.clone());
             SigVerifyStage::new(packet_receiver, verifier, "tpu-verifier")
         };
 
@@ -224,38 +219,14 @@ impl Tpu {
         let (gossip_vote_sender, gossip_vote_receiver) =
             banking_tracer.create_channel_gossip_vote();
 
-        let block_builder_fee_info = Arc::new(Mutex::new(BlockBuilderFeeInfo {
-            block_builder: cluster_info.keypair().pubkey(),
-            block_builder_commission: 0,
-        }));
-
         let (bundle_sender, bundle_receiver) = unbounded();
-        let block_engine_stage = BlockEngineStage::new(
-            block_engine_config,
+        let pbs_stage = PbsEngineStage::new(
+            pbs_config,
             bundle_sender,
-            cluster_info.clone(),
-            packet_sender.clone(),
-            non_vote_sender.clone(),
-            exit.clone(),
-            &block_builder_fee_info,
-        );
-
-        let (heartbeat_tx, heartbeat_rx) = unbounded();
-        let fetch_stage_manager = FetchStageManager::new(
-            cluster_info.clone(),
-            heartbeat_rx,
-            packet_intercept_receiver,
-            packet_sender.clone(),
-            exit.clone(),
-        );
-
-        let relayer_stage = RelayerStage::new(
-            relayer_config,
-            cluster_info.clone(),
-            heartbeat_tx,
-            packet_sender,
+            pbs_receiver,
             non_vote_sender,
             exit.clone(),
+            bank_forks.clone(),
         );
 
         let cluster_info_vote_listener = ClusterInfoVoteListener::new(
@@ -274,15 +245,11 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
-        let tip_manager = TipManager::new(tip_manager_config);
-
         let bundle_account_locker = BundleAccountLocker::default();
 
         // tip accounts can't be used in BankingStage to avoid someone from stealing tips mid-slot.
         // it also helps reduce surface area for potential account contention
-        let mut blacklisted_accounts = HashSet::new();
-        blacklisted_accounts.insert(tip_manager.tip_payment_config_pubkey());
-        blacklisted_accounts.extend(tip_manager.get_tip_accounts());
+        let blacklisted_accounts = HashSet::new();
         let banking_stage = BankingStage::new(
             block_production_method,
             cluster_info,
@@ -308,9 +275,7 @@ impl Tpu {
             replay_vote_sender,
             log_messages_bytes_limit,
             exit.clone(),
-            tip_manager,
             bundle_account_locker,
-            &block_builder_fee_info,
             preallocated_bundle_cost,
             bank_forks.clone(),
             prioritization_fee_cache,
@@ -340,7 +305,7 @@ impl Tpu {
             bank_forks,
             shred_version,
             turbine_quic_endpoint_sender,
-            shred_receiver_address,
+            // shred_receiver_address,
         );
 
         Self {
@@ -355,9 +320,10 @@ impl Tpu {
             tpu_entry_notifier,
             staked_nodes_updater_service,
             tracer_thread_hdl,
-            block_engine_stage,
-            relayer_stage,
-            fetch_stage_manager,
+            pbs_stage,
+            // block_engine_stage,
+            // relayer_stage,
+            // fetch_stage_manager,
             bundle_stage,
         }
     }
@@ -373,9 +339,10 @@ impl Tpu {
             self.tpu_quic_t.join(),
             self.tpu_forwards_quic_t.join(),
             self.bundle_stage.join(),
-            self.relayer_stage.join(),
-            self.block_engine_stage.join(),
-            self.fetch_stage_manager.join(),
+            self.pbs_stage.join(),
+            // self.relayer_stage.join(),
+            // self.block_engine_stage.join(),
+            // self.fetch_stage_manager.join(),
         ];
         let broadcast_result = self.broadcast_stage.join();
         for result in results {
