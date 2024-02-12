@@ -347,6 +347,7 @@ pub fn load_and_execute_bundle<'a>(
                 &mut metrics.execute_timings,
                 Some(account_overrides),
                 *log_messages_bytes_limit,
+                true,
             ));
         debug!(
             "bundle id: {} loaded_transactions: {:?}",
