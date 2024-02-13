@@ -4,8 +4,7 @@ use {
     solana_sdk::pubkey::Pubkey,
     std::{
         collections::HashSet,
-        net::SocketAddr,
-        sync::{Arc, Mutex, RwLock},
+        sync::{Arc, RwLock},
     },
 };
 

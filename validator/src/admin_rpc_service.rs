@@ -30,7 +30,6 @@ use {
         fmt::{self, Display},
         net::SocketAddr,
         path::{Path, PathBuf},
-        str::FromStr,
         sync::{Arc, RwLock},
         thread::{self, Builder},
         time::{Duration, SystemTime},
@@ -455,9 +454,9 @@ impl AdminRpc for AdminRpcImpl {
 
     fn set_block_engine_config(
         &self,
-        meta: Self::Metadata,
-        block_engine_url: String,
-        trust_packets: bool,
+        _meta: Self::Metadata,
+        _block_engine_url: String,
+        _trust_packets: bool,
     ) -> Result<()> {
         debug!("set_block_engine_config request received");
         // let config = BlockEngineConfig {
@@ -514,11 +513,11 @@ impl AdminRpc for AdminRpcImpl {
 
     fn set_relayer_config(
         &self,
-        meta: Self::Metadata,
-        relayer_url: String,
-        trust_packets: bool,
-        expected_heartbeat_interval_ms: u64,
-        max_failed_heartbeats: u64,
+        _meta: Self::Metadata,
+        _relayer_url: String,
+        _trust_packets: bool,
+        _expected_heartbeat_interval_ms: u64,
+        _max_failed_heartbeats: u64,
     ) -> Result<()> {
         // debug!("set_relayer_config request received");
         // let expected_heartbeat_interval = Duration::from_millis(expected_heartbeat_interval_ms);
@@ -544,19 +543,19 @@ impl AdminRpc for AdminRpcImpl {
         Ok(())
     }
 
-    fn set_shred_receiver_address(&self, meta: Self::Metadata, addr: String) -> Result<()> {
-        let shred_receiver_address = if addr.is_empty() {
-            None
-        } else {
-            Some(SocketAddr::from_str(&addr).map_err(|_| {
-                jsonrpc_core::error::Error::invalid_params(format!(
-                    "invalid shred receiver address: {}",
-                    addr
-                ))
-            })?)
-        };
+    fn set_shred_receiver_address(&self, meta: Self::Metadata, _addr: String) -> Result<()> {
+        // let shred_receiver_address = if addr.is_empty() {
+        //     None
+        // } else {
+        //     Some(SocketAddr::from_str(&addr).map_err(|_| {
+        //         jsonrpc_core::error::Error::invalid_params(format!(
+        //             "invalid shred receiver address: {}",
+        //             addr
+        //         ))
+        //     })?)
+        // };
 
-        meta.with_post_init(|post_init| {
+        meta.with_post_init(|_| {
             // *post_init.shred_receiver_address.write().unwrap() = shred_receiver_address;
             Ok(())
         })
