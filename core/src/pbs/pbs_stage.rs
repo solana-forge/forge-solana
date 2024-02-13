@@ -5,7 +5,7 @@ use {
         pbs::{interceptor::AuthInterceptor, PbsError},
         proto_packet_to_packet,
     },
-    crossbeam_channel::Sender,
+    crossbeam_channel::{SendError, Sender},
     forge_protos::proto::pbs::{
         pbs_validator_client::PbsValidatorClient, BundlesResponse,
         SanitizedTransaction as ProtoSanitizedTransaction, SanitizedTransactionRequest,
@@ -13,13 +13,18 @@ use {
     futures::StreamExt,
     prost_types::Timestamp,
     reqwest::header,
-    solana_perf::packet::PacketBatch,
+    solana_perf::{packet::PacketBatch, sigverify::PacketError},
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
+        packet::Packet,
         saturating_add_assign,
+        short_vec::decode_shortu16_len,
+        signature::Signature,
         transaction::{MessageHash, SanitizedTransaction},
     },
     std::{
+        collections::HashSet,
+        mem::size_of,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
@@ -46,6 +51,8 @@ const CONNECTION_TIMEOUT_S: u64 = 10;
 const CONNECTION_BACKOFF_S: u64 = 5;
 
 const REQUEST_TIMEOUT_MS: u64 = 300;
+
+const BUNDLE_LIFE_TIME_IN_DELAYER_MS: u64 = 400;
 
 #[derive(Default)]
 struct PbsStageStats {
@@ -163,10 +170,12 @@ impl PbsEngineStage {
         );
 
         let (pbs_sender, mut pbs_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (drop_packet_sender, bundle_receiver) = tokio::sync::mpsc::unbounded_channel();
         let delayer_join_handle = Self::start_delayer(
             forwarder_receiver,
             banking_packet_sender,
             pbs_sender,
+            bundle_receiver,
             exit.clone(),
         );
 
@@ -187,6 +196,7 @@ impl PbsEngineStage {
                 &pbs_config,
                 &bundle_tx,
                 &mut pbs_receiver,
+                &drop_packet_sender,
                 &is_pbs_active,
                 &exit,
                 &bank_forks,
@@ -259,12 +269,14 @@ impl PbsEngineStage {
         sigverified_receiver: UnboundedReceiver<BankingPacketBatch>,
         banking_packet_sender: BankingPacketSender,
         pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
+        bundle_receiver: UnboundedReceiver<Vec<Signature>>,
         exit: Arc<AtomicBool>,
     ) -> TokioJoinHandle<()> {
         tokio::spawn(Self::delay_packet_batches(
             sigverified_receiver,
             banking_packet_sender,
             pbs_sender,
+            bundle_receiver,
             exit,
         ))
     }
@@ -274,6 +286,7 @@ impl PbsEngineStage {
         global_config: &Arc<Mutex<PbsConfig>>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
         receiver: &mut UnboundedReceiver<(BankingPacketBatch, Instant)>,
+        drop_packet_sender: &UnboundedSender<Vec<Signature>>,
         is_pbs_active: &Arc<AtomicBool>,
         exit: &Arc<AtomicBool>,
         bank_forks: &Arc<RwLock<BankForks>>,
@@ -316,6 +329,7 @@ impl PbsEngineStage {
             pbs_client,
             bundle_tx,
             receiver,
+            drop_packet_sender,
             is_pbs_active,
             exit,
             bank_forks,
@@ -330,6 +344,7 @@ impl PbsEngineStage {
         mut client: PbsValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
         receiver: &mut UnboundedReceiver<(BankingPacketBatch, Instant)>,
+        drop_packet_sender: &UnboundedSender<Vec<Signature>>,
         is_pbs_active: &Arc<AtomicBool>,
         exit: &Arc<AtomicBool>,
         bank_forks: &Arc<RwLock<BankForks>>,
@@ -359,7 +374,7 @@ impl PbsEngineStage {
                 biased;
 
                 maybe_bundles = bundles_stream.message() => {
-                    Self::handle_maybe_bundles(maybe_bundles, bundle_tx, &mut pbs_stats)?;
+                    Self::handle_maybe_bundles(maybe_bundles, bundle_tx, drop_packet_sender, &mut pbs_stats)?;
                 }
 
                 Some((packet_batch, deadline)) = receiver.recv() => {
@@ -386,6 +401,7 @@ impl PbsEngineStage {
     fn handle_maybe_bundles(
         maybe_bundles_response: Result<Option<BundlesResponse>, Status>,
         bundle_sender: &Sender<Vec<PacketBundle>>,
+        delayer_sender: &UnboundedSender<Vec<Signature>>,
         pbs_stats: &mut PbsStageStats,
     ) -> Result<(), PbsError> {
         let bundles_response = maybe_bundles_response?.ok_or(PbsError::GrpcStreamDisconnected)?;
@@ -412,9 +428,30 @@ impl PbsEngineStage {
             bundles.iter().map(|bundle| bundle.batch.len() as u64).sum()
         );
 
+        Self::send_bundles_to_delayer(&bundles, delayer_sender)?;
+
         // NOTE: bundles are sanitized in bundle_sanitizer module
         bundle_sender
             .send(bundles)
+            .map_err(|_| PbsError::PacketForwardError)
+    }
+
+    fn send_bundles_to_delayer(
+        bundles: &[PacketBundle],
+        delayer_sender: &UnboundedSender<Vec<Signature>>,
+    ) -> Result<(), PbsError> {
+        let signatures = bundles
+            .iter()
+            .flat_map(|bundle| {
+                bundle
+                    .batch
+                    .iter()
+                    .filter_map(|packet| extract_first_signature(packet).ok())
+            })
+            .collect();
+
+        delayer_sender
+            .send(signatures)
             .map_err(|_| PbsError::PacketForwardError)
     }
 
@@ -483,19 +520,39 @@ impl PbsEngineStage {
         mut sigverified_receiver: UnboundedReceiver<BankingPacketBatch>,
         banking_packet_sender: BankingPacketSender,
         pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
+        mut bundle_receiver: UnboundedReceiver<Vec<Signature>>,
         exit: Arc<AtomicBool>,
     ) {
         const DELAY_PACKET_BATCHES: Duration = Duration::from_millis(REQUEST_TIMEOUT_MS);
+
         let mut delayed_queue: DelayQueue<BankingPacketBatch> = DelayQueue::new();
+
+        let mut bundles: HashSet<Signature> = HashSet::new();
+        let mut bundles_expirations: DelayQueue<Signature> = DelayQueue::new();
 
         while !exit.load(Ordering::Relaxed) {
             tokio::select! {
                 biased;
 
-                Some(packet_batch) = delayed_queue.next() => {
-                    match packet_batch {
+                Some(signatures) = bundle_receiver.recv() => {
+                    Self::handle_bundles_in_delayer(signatures, &mut bundles, &mut bundles_expirations);
+                }
+
+                Some(maybe_signature) = bundles_expirations.next() => {
+                    match maybe_signature {
+                        Ok(signature) => {
+                            bundles.remove(&signature.into_inner());
+                        }
+                        Err(err) => {
+                            warn!("delayed_queue timer error: {}", err.to_string());
+                        }
+                    }
+                }
+
+                Some(maybe_packet_batch) = delayed_queue.next() => {
+                    match maybe_packet_batch {
                         Ok(packet_batch) => {
-                            if let Err(_) = banking_packet_sender.send(packet_batch.into_inner()) {
+                            if let Err(_) = Self::handle_delayed_banking_packet_batch(packet_batch.into_inner(), &banking_packet_sender, &bundles) {
                                 error!("banking packet receiver closed");
                                 break;
                             }
@@ -515,6 +572,57 @@ impl PbsEngineStage {
                     }
                 }
             }
+        }
+    }
+
+    fn handle_delayed_banking_packet_batch(
+        banking_packet_batch: BankingPacketBatch,
+        banking_packet_sender: &BankingPacketSender,
+        bundles: &HashSet<Signature>,
+    ) -> Result<(), SendError<BankingPacketBatch>> {
+        let exclude: Vec<_> = banking_packet_batch
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(pos_outer, batch)| {
+                let positions: Vec<_> = batch
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos_inner, packet)| {
+                        let signature = extract_first_signature(packet).ok()?;
+                        bundles.contains(&signature).then_some(pos_inner)
+                    })
+                    .collect();
+                (!positions.is_empty()).then_some((pos_outer, positions))
+            })
+            .collect();
+
+        if exclude.is_empty() {
+            return banking_packet_sender.send(banking_packet_batch);
+        }
+
+        let (mut banking_packet_batch, stats) = banking_packet_batch.as_ref().clone();
+        for (outer, inner) in exclude {
+            let batch = &mut banking_packet_batch[outer];
+            for pos in inner {
+                batch[pos].meta_mut().set_discard(true);
+            }
+        }
+
+        banking_packet_sender.send(BankingPacketBatch::new((banking_packet_batch, stats)))
+    }
+
+    fn handle_bundles_in_delayer(
+        signatures: Vec<Signature>,
+        bundles: &mut HashSet<Signature>,
+        expirations: &mut DelayQueue<Signature>,
+    ) {
+        for signature in signatures {
+            expirations.insert(
+                signature.clone(),
+                Duration::from_millis(BUNDLE_LIFE_TIME_IN_DELAYER_MS),
+            );
+            bundles.insert(signature);
         }
     }
 
@@ -545,4 +653,28 @@ fn sanitized_to_proto_sanitized(tx: SanitizedTransaction) -> Option<ProtoSanitiz
         message_hash,
         loaded_addresses,
     })
+}
+
+fn extract_first_signature(packet: &Packet) -> Result<Signature, PacketError> {
+    // should have at least 1 signature and sig lengths
+    let _ = 1usize
+        .checked_add(size_of::<Signature>())
+        .filter(|v| *v <= packet.meta().size)
+        .ok_or(PacketError::InvalidLen)?;
+
+    // read the length of Transaction.signatures (serialized with short_vec)
+    let (_sig_len_untrusted, sig_start) = packet
+        .data(..)
+        .and_then(|bytes| decode_shortu16_len(bytes).ok())
+        .ok_or(PacketError::InvalidShortVec)?;
+
+    let sig_end = sig_start
+        .checked_add(size_of::<Signature>())
+        .ok_or(PacketError::InvalidLen)?;
+
+    packet
+        .data(sig_start..sig_end)
+        .ok_or(PacketError::InvalidLen)?
+        .try_into()
+        .map_err(|_| PacketError::InvalidLen)
 }

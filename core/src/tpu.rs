@@ -29,9 +29,7 @@ use {
     },
     solana_poh::poh_recorder::{PohRecorder, WorkingBankEntry},
     solana_rpc::{
-        optimistically_confirmed_bank_tracker::{
-            BankNotificationSender,
-        },
+        optimistically_confirmed_bank_tracker::BankNotificationSender,
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache},
