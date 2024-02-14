@@ -14,6 +14,7 @@ use {
     prost_types::Timestamp,
     reqwest::header,
     solana_perf::packet::PacketBatch,
+    solana_poh::poh_recorder::PohRecorder,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
         saturating_add_assign,
@@ -45,7 +46,7 @@ use {
 const CONNECTION_TIMEOUT_S: u64 = 10;
 const CONNECTION_BACKOFF_S: u64 = 5;
 
-const REQUEST_TIMEOUT_MS: u64 = 300;
+const DELAY_PACKET_BATCHES_MS: u64 = 300;
 
 #[derive(Default)]
 struct PbsStageStats {
@@ -108,6 +109,7 @@ impl PbsEngineStage {
         banking_packet_sender: BankingPacketSender,
         exit: Arc<AtomicBool>,
         bank_forks: Arc<RwLock<BankForks>>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
     ) -> Self {
         let thread = Builder::new()
             .name("pbs-stage".to_string())
@@ -123,6 +125,7 @@ impl PbsEngineStage {
                     banking_packet_sender,
                     exit,
                     bank_forks,
+                    poh_recorder,
                 ));
             })
             .unwrap();
@@ -147,6 +150,7 @@ impl PbsEngineStage {
         banking_packet_sender: BankingPacketSender,
         exit: Arc<AtomicBool>,
         bank_forks: Arc<RwLock<BankForks>>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
     ) {
         const CONNECTION_TIMEOUT: Duration = Duration::from_secs(CONNECTION_TIMEOUT_S);
         const CONNECTION_BACKOFF: Duration = Duration::from_secs(CONNECTION_BACKOFF_S);
@@ -168,6 +172,7 @@ impl PbsEngineStage {
             banking_packet_sender,
             pbs_sender,
             exit.clone(),
+            poh_recorder,
         );
 
         while !exit.load(Ordering::Relaxed) {
@@ -260,12 +265,14 @@ impl PbsEngineStage {
         banking_packet_sender: BankingPacketSender,
         pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
         exit: Arc<AtomicBool>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
     ) -> TokioJoinHandle<()> {
         tokio::spawn(Self::delay_packet_batches(
             sigverified_receiver,
             banking_packet_sender,
             pbs_sender,
             exit,
+            poh_recorder,
         ))
     }
 
@@ -484,20 +491,42 @@ impl PbsEngineStage {
         banking_packet_sender: BankingPacketSender,
         pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
         exit: Arc<AtomicBool>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
     ) {
-        const DELAY_PACKET_BATCHES: Duration = Duration::from_millis(REQUEST_TIMEOUT_MS);
+        const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
+        const SLOT_START_DELAY: u16 = 2; // 2 ticks, 20 ms after slot start
+        const DELAY_PACKET_BATCHES: Duration = Duration::from_millis(DELAY_PACKET_BATCHES_MS);
         let mut delayed_queue: DelayQueue<BankingPacketBatch> = DelayQueue::new();
+
+        let mut slot_boundary_check_tick = interval(SLOT_BOUNDARY_CHECK_PERIOD);
+        let mut status = LeaderStatus::default();
 
         while !exit.load(Ordering::Relaxed) {
             tokio::select! {
                 biased;
 
-                Some(packet_batch) = delayed_queue.next() => {
+                _ = slot_boundary_check_tick.tick() => {
+                    let is_in_progress = is_poh_recorder_in_progress(&poh_recorder);
+                    status = match (status, is_in_progress) {
+                        (LeaderStatus::StandBy, true) => LeaderStatus::BankStart(0),
+                        (LeaderStatus::BankStart(tick), true) if tick < SLOT_START_DELAY => LeaderStatus::BankStart(tick.checked_add(1).unwrap()),
+                        (LeaderStatus::BankStart(_), true) => LeaderStatus::InProgress,
+                        (LeaderStatus::BankStart(_), false) => LeaderStatus::StandBy,
+                        (LeaderStatus::InProgress, false) => LeaderStatus::Completed,
+                        (LeaderStatus::Completed, true) => LeaderStatus::BankStart(0),
+                        _ => status,
+                    };
+                }
+
+                Some(packet_batch) = delayed_queue.next(), if matches!(status, LeaderStatus::InProgress | LeaderStatus::Completed) => {
                     match packet_batch {
                         Ok(packet_batch) => {
                             if let Err(_) = banking_packet_sender.send(packet_batch.into_inner()) {
                                 error!("banking packet receiver closed");
                                 break;
+                            }
+                            if delayed_queue.is_empty() && matches!(status, LeaderStatus::Completed) {
+                                status = LeaderStatus::StandBy;
                             }
                         }
                         Err(err) => {
@@ -545,4 +574,21 @@ fn sanitized_to_proto_sanitized(tx: SanitizedTransaction) -> Option<ProtoSanitiz
         message_hash,
         loaded_addresses,
     })
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum LeaderStatus {
+    #[default]
+    StandBy,
+    BankStart(u16),
+    InProgress,
+    Completed,
+}
+
+fn is_poh_recorder_in_progress(poh_recorder: &Arc<RwLock<PohRecorder>>) -> bool {
+    let poh_recorder = poh_recorder.read().unwrap();
+    poh_recorder
+        .bank_start()
+        .map(|bank_start| bank_start.should_working_bank_still_be_processing_txs())
+        .unwrap_or_default()
 }

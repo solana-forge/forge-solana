@@ -29,9 +29,7 @@ use {
     },
     solana_poh::poh_recorder::{PohRecorder, WorkingBankEntry},
     solana_rpc::{
-        optimistically_confirmed_bank_tracker::{
-            BankNotificationSender,
-        },
+        optimistically_confirmed_bank_tracker::BankNotificationSender,
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache},
@@ -227,6 +225,7 @@ impl Tpu {
             non_vote_sender,
             exit.clone(),
             bank_forks.clone(),
+            poh_recorder.clone(),
         );
 
         let cluster_info_vote_listener = ClusterInfoVoteListener::new(
