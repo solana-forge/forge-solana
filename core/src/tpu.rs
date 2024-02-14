@@ -221,6 +221,7 @@ impl Tpu {
         let pbs_stage = PbsEngineStage::new(
             pbs_config,
             bundle_sender,
+            cluster_info.clone(),
             pbs_receiver,
             non_vote_sender,
             exit.clone(),

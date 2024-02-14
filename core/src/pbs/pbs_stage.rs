@@ -12,12 +12,13 @@ use {
     },
     futures::StreamExt,
     prost_types::Timestamp,
-    reqwest::header,
+    solana_gossip::cluster_info::ClusterInfo,
     solana_perf::packet::PacketBatch,
     solana_poh::poh_recorder::PohRecorder,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
         saturating_add_assign,
+        signature::Signer,
         transaction::{MessageHash, SanitizedTransaction},
     },
     std::{
@@ -103,6 +104,8 @@ impl PbsEngineStage {
         pbs_config: Arc<Mutex<PbsConfig>>,
         // Channel that bundles get piped through.
         bundle_tx: Sender<Vec<PacketBundle>>,
+        // The keypair stored here is used to auth
+        cluster_info: Arc<ClusterInfo>,
         // Channel that trusted packets after SigVerify get piped through.
         sigverified_receiver: BankingPacketReceiver,
         // Channel that trusted packets get piped through.
@@ -121,6 +124,7 @@ impl PbsEngineStage {
                 rt.block_on(Self::start(
                     pbs_config,
                     bundle_tx,
+                    cluster_info,
                     sigverified_receiver,
                     banking_packet_sender,
                     exit,
@@ -146,6 +150,7 @@ impl PbsEngineStage {
     async fn start(
         pbs_config: Arc<Mutex<PbsConfig>>,
         bundle_tx: Sender<Vec<PacketBundle>>,
+        cluster_info: Arc<ClusterInfo>,
         sigverified_receiver: BankingPacketReceiver,
         banking_packet_sender: BankingPacketSender,
         exit: Arc<AtomicBool>,
@@ -191,6 +196,7 @@ impl PbsEngineStage {
                 &local_pbs_config,
                 &pbs_config,
                 &bundle_tx,
+                &cluster_info,
                 &mut pbs_receiver,
                 &is_pbs_active,
                 &exit,
@@ -280,6 +286,7 @@ impl PbsEngineStage {
         local_config: &PbsConfig,
         global_config: &Arc<Mutex<PbsConfig>>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
+        cluster_info: &Arc<ClusterInfo>,
         receiver: &mut UnboundedReceiver<(BankingPacketBatch, Instant)>,
         is_pbs_active: &Arc<AtomicBool>,
         exit: &Arc<AtomicBool>,
@@ -314,7 +321,7 @@ impl PbsEngineStage {
 
         let pbs_client = PbsValidatorClient::with_interceptor(
             pbs_channel,
-            AuthInterceptor::new(local_config.uuid.clone()),
+            AuthInterceptor::new(cluster_info.keypair().pubkey().to_string()),
         );
 
         Self::start_consuming(
@@ -550,14 +557,6 @@ impl PbsEngineStage {
     pub fn is_valid_pbs_config(config: &PbsConfig) -> bool {
         if config.pbs_url.is_empty() {
             warn!("can't connect to pbs. missing pbs_url.");
-            return false;
-        }
-        if config.uuid.is_empty() {
-            warn!("can't connect to pbs. missing uuid.");
-            return false;
-        }
-        if let Err(e) = header::HeaderValue::from_str(&config.uuid) {
-            warn!("can't connect to pbs. invalid uuid - {}", e.to_string());
             return false;
         }
         true
