@@ -30,7 +30,16 @@ message SanitizedTransactionRequest {
   repeated SanitizedTransaction transactions = 2;
 }
 
+message SimulationSettingsRequest {}
+
+message SimulationSettingsResponse {
+  repeated bytes account_include = 1;
+  repeated bytes account_exclude = 2;
+  repeated bytes account_required = 3;
+}
+
 /// Validators can connect to PBS to send packets and receive and bundles.
 service PbsValidator {
   rpc SubscribeSanitized (stream SanitizedTransactionRequest) returns (stream BundlesResponse) {}
+  rpc GetSimulationSettings (SimulationSettingsRequest) returns (SimulationSettingsResponse) {}
 }
