@@ -171,13 +171,18 @@ impl PbsEngineStage {
             exit.clone(),
         );
 
+        let (slot_boundary_sender, slot_boundary_receiver) =
+            tokio::sync::watch::channel(SlotBoundaryStatus::default());
+        let slot_boundary_checker_join_handle =
+            Self::start_slot_boundary_checker(poh_recorder, slot_boundary_sender, exit.clone());
+
         let (pbs_sender, mut pbs_receiver) = tokio::sync::mpsc::unbounded_channel();
         let delayer_join_handle = Self::start_delayer(
             forwarder_receiver,
             banking_packet_sender,
             pbs_sender,
             exit.clone(),
-            poh_recorder,
+            slot_boundary_receiver,
         );
 
         while !exit.load(Ordering::Relaxed) {
@@ -218,7 +223,12 @@ impl PbsEngineStage {
         }
         is_pbs_active.store(false, Ordering::Relaxed);
 
-        try_join!(forwarder_join_handle, delayer_join_handle).unwrap();
+        try_join!(
+            forwarder_join_handle,
+            delayer_join_handle,
+            slot_boundary_checker_join_handle
+        )
+        .unwrap();
     }
 
     // Forward packets from the sigverified_receiver to the banking_packet_sender if pbs isn't ready
@@ -271,14 +281,14 @@ impl PbsEngineStage {
         banking_packet_sender: BankingPacketSender,
         pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
         exit: Arc<AtomicBool>,
-        poh_recorder: Arc<RwLock<PohRecorder>>,
+        slot_boundary_receiver: tokio::sync::watch::Receiver<SlotBoundaryStatus>,
     ) -> TokioJoinHandle<()> {
         tokio::spawn(Self::delay_packet_batches(
             sigverified_receiver,
             banking_packet_sender,
             pbs_sender,
             exit,
-            poh_recorder,
+            slot_boundary_receiver,
         ))
     }
 
@@ -498,42 +508,55 @@ impl PbsEngineStage {
         banking_packet_sender: BankingPacketSender,
         pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
         exit: Arc<AtomicBool>,
-        poh_recorder: Arc<RwLock<PohRecorder>>,
+        mut slot_boundary_receiver: tokio::sync::watch::Receiver<SlotBoundaryStatus>,
     ) {
-        const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
-        const SLOT_START_DELAY: u16 = 2; // 2 ticks, 20 ms after slot start
+        const SLOT_START_DELAY: Duration = Duration::from_millis(20);
         const DELAY_PACKET_BATCHES: Duration = Duration::from_millis(DELAY_PACKET_BATCHES_MS);
         let mut delayed_queue: DelayQueue<BankingPacketBatch> = DelayQueue::new();
 
-        let mut slot_boundary_check_tick = interval(SLOT_BOUNDARY_CHECK_PERIOD);
-        let mut status = LeaderStatus::default();
+        let mut status = match *slot_boundary_receiver.borrow_and_update() {
+            SlotBoundaryStatus::StandBy => RunningLeaderStatus::StandBy,
+            SlotBoundaryStatus::InProgress => RunningLeaderStatus::InProgress,
+        };
+
+        // The maximum duration for a sleep, so it will not wake up
+        let slot_start_delay = tokio::time::sleep(Duration::from_secs(68719476734));
+        tokio::pin!(slot_start_delay);
 
         while !exit.load(Ordering::Relaxed) {
             tokio::select! {
                 biased;
 
-                _ = slot_boundary_check_tick.tick() => {
-                    let is_in_progress = is_poh_recorder_in_progress(&poh_recorder);
-                    status = match (status, is_in_progress) {
-                        (LeaderStatus::StandBy, true) => LeaderStatus::BankStart(0),
-                        (LeaderStatus::BankStart(tick), true) if tick < SLOT_START_DELAY => LeaderStatus::BankStart(tick.checked_add(1).unwrap()),
-                        (LeaderStatus::BankStart(_), true) => LeaderStatus::InProgress,
-                        (LeaderStatus::BankStart(_), false) => LeaderStatus::StandBy,
-                        (LeaderStatus::InProgress, false) => LeaderStatus::Completed,
-                        (LeaderStatus::Completed, true) => LeaderStatus::BankStart(0),
-                        _ => status,
+                maybe_slot_boundary_changed = slot_boundary_receiver.changed() => {
+                    if let Err(_) = maybe_slot_boundary_changed {
+                        error!("slot boundary checker sender closed");
+                        break;
+                    }
+                    status = match (status, *slot_boundary_receiver.borrow_and_update()) {
+                        (RunningLeaderStatus::StandBy, SlotBoundaryStatus::InProgress) | (RunningLeaderStatus::Completed, SlotBoundaryStatus::InProgress) =>
+                        {
+                            slot_start_delay.as_mut().reset(Instant::now() + SLOT_START_DELAY);
+                            RunningLeaderStatus::BankStart
+                        },
+                        (RunningLeaderStatus::BankStart, SlotBoundaryStatus::StandBy) => RunningLeaderStatus::StandBy,
+                        (RunningLeaderStatus::InProgress, SlotBoundaryStatus::StandBy) => RunningLeaderStatus::Completed,
+                        (_, _) => status,
                     };
                 }
 
-                Some(packet_batch) = delayed_queue.next(), if matches!(status, LeaderStatus::InProgress | LeaderStatus::Completed) => {
+                _ = &mut slot_start_delay, if matches!(status, RunningLeaderStatus::BankStart) => {
+                    status = RunningLeaderStatus::InProgress;
+                }
+
+                Some(packet_batch) = delayed_queue.next(), if matches!(status, RunningLeaderStatus::InProgress | RunningLeaderStatus::Completed) => {
                     match packet_batch {
                         Ok(packet_batch) => {
                             if let Err(_) = banking_packet_sender.send(packet_batch.into_inner()) {
                                 error!("banking packet receiver closed");
                                 break;
                             }
-                            if delayed_queue.is_empty() && matches!(status, LeaderStatus::Completed) {
-                                status = LeaderStatus::StandBy;
+                            if delayed_queue.is_empty() && matches!(status, RunningLeaderStatus::Completed) {
+                                status = RunningLeaderStatus::StandBy;
                             }
                         }
                         Err(err) => {
@@ -551,6 +574,41 @@ impl PbsEngineStage {
                     }
                 }
             }
+        }
+    }
+
+    fn start_slot_boundary_checker(
+        poh_recorder: Arc<RwLock<PohRecorder>>,
+        leader_status_sender: tokio::sync::watch::Sender<SlotBoundaryStatus>,
+        exit: Arc<AtomicBool>,
+    ) -> TokioJoinHandle<()> {
+        tokio::spawn(Self::slot_boundary_checker(
+            poh_recorder,
+            leader_status_sender,
+            exit,
+        ))
+    }
+
+    async fn slot_boundary_checker(
+        poh_recorder: Arc<RwLock<PohRecorder>>,
+        leader_status_sender: tokio::sync::watch::Sender<SlotBoundaryStatus>,
+        exit: Arc<AtomicBool>,
+    ) {
+        const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
+        let mut slot_boundary_check_tick = interval(SLOT_BOUNDARY_CHECK_PERIOD);
+
+        while !exit.load(Ordering::Relaxed) {
+            slot_boundary_check_tick.tick().await;
+            let recent_status =
+                SlotBoundaryStatus::from(is_poh_recorder_in_progress(&poh_recorder));
+            leader_status_sender.send_if_modified(|status| {
+                if *status != recent_status {
+                    *status = recent_status;
+                    true
+                } else {
+                    false
+                }
+            });
         }
     }
 
@@ -584,12 +642,29 @@ fn sanitized_to_proto_sanitized(tx: SanitizedTransaction) -> Option<ProtoSanitiz
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-enum LeaderStatus {
+enum RunningLeaderStatus {
     #[default]
     StandBy,
-    BankStart(u16),
+    BankStart,
     InProgress,
     Completed,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum SlotBoundaryStatus {
+    #[default]
+    StandBy,
+    InProgress,
+}
+
+impl From<bool> for SlotBoundaryStatus {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::InProgress
+        } else {
+            Self::StandBy
+        }
+    }
 }
 
 fn is_poh_recorder_in_progress(poh_recorder: &Arc<RwLock<PohRecorder>>) -> bool {
