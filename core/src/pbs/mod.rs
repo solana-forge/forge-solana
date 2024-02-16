@@ -31,4 +31,7 @@ pub enum PbsError {
 
     #[error("SlotBoundaryCheckerError")]
     SlotBoundaryCheckerError,
+
+    #[error("SimulationSettingsError")]
+    SimulationSettingsError,
 }

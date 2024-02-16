@@ -33,9 +33,10 @@ message SanitizedTransactionRequest {
 message SimulationSettingsRequest {}
 
 message SimulationSettingsResponse {
-  repeated bytes account_include = 1;
-  repeated bytes account_exclude = 2;
-  repeated bytes account_required = 3;
+  optional bool simulate_all = 1;
+  repeated bytes account_include = 2;
+  repeated bytes account_exclude = 3;
+  repeated bytes account_required = 4;
 }
 
 /// Validators can connect to PBS to send packets and receive and bundles.

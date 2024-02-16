@@ -9,6 +9,7 @@ use {
     forge_protos::proto::pbs::{
         pbs_validator_client::PbsValidatorClient, BundlesResponse,
         SanitizedTransaction as ProtoSanitizedTransaction, SanitizedTransactionRequest,
+        SimulationSettingsRequest, SimulationSettingsResponse,
     },
     futures::StreamExt,
     prost_types::Timestamp,
@@ -17,6 +18,7 @@ use {
     solana_poh::poh_recorder::PohRecorder,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
+        pubkey::Pubkey,
         saturating_add_assign,
         signature::Signer,
         transaction::{MessageHash, SanitizedTransaction},
@@ -57,6 +59,7 @@ struct PbsStageStats {
     num_empty_packet_batches: u64,
     num_sanitized_transactions: u64,
     num_empty_tx_batches: u64,
+    num_simulated_transactions: u64,
 }
 
 impl PbsStageStats {
@@ -85,6 +88,14 @@ impl PbsStageStats {
         datapoint_info!(
             "pbs_stage-stats",
             ("num_empty_tx_batches", self.num_empty_tx_batches, i64),
+        );
+        datapoint_info!(
+            "pbs_stage-stats",
+            (
+                "num_simulated_transactions",
+                self.num_simulated_transactions,
+                i64
+            ),
         );
     }
 }
@@ -330,10 +341,20 @@ impl PbsEngineStage {
             .map_err(|_| PbsError::PbsConnectionTimeout)?
             .map_err(|e| PbsError::PbsConnectionError(e.to_string()))?;
 
-        let pbs_client = PbsValidatorClient::with_interceptor(
+        let mut pbs_client = PbsValidatorClient::with_interceptor(
             pbs_channel,
             AuthInterceptor::new(local_config.uuid.clone(), cluster_info.keypair().pubkey()),
         );
+
+        let simulation_settings = timeout(
+            *connection_timeout,
+            pbs_client.get_simulation_settings(SimulationSettingsRequest {}),
+        )
+        .await
+        .map_err(|_| PbsError::MethodTimeout("pbs_simulation_settings".to_string()))?
+        .map_err(|e| PbsError::MethodError(e.to_string()))?
+        .into_inner()
+        .try_into()?;
 
         Self::start_consuming(
             local_config,
@@ -346,6 +367,7 @@ impl PbsEngineStage {
             bank_forks,
             slot_boundary_receiver,
             connection_timeout,
+            &simulation_settings,
         )
         .await
     }
@@ -362,6 +384,7 @@ impl PbsEngineStage {
         bank_forks: &Arc<RwLock<BankForks>>,
         slot_boundary_receiver: &mut tokio::sync::watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
+        simulation_settings: &SimulationSettings,
     ) -> Result<(), PbsError> {
         const METRICS_TICK: Duration = Duration::from_secs(1);
 
@@ -688,4 +711,41 @@ fn is_poh_recorder_in_progress(poh_recorder: &Arc<RwLock<PohRecorder>>) -> bool 
         .bank_start()
         .map(|bank_start| bank_start.should_working_bank_still_be_processing_txs())
         .unwrap_or_default()
+}
+
+struct SimulationSettings {
+    simulate_all: bool,
+    account_include: Vec<Pubkey>,
+    account_exclude: Vec<Pubkey>,
+    account_required: Vec<Pubkey>,
+}
+
+impl TryFrom<SimulationSettingsResponse> for SimulationSettings {
+    type Error = PbsError;
+    fn try_from(value: SimulationSettingsResponse) -> Result<Self, Self::Error> {
+        let SimulationSettingsResponse {
+            simulate_all,
+            account_include,
+            account_exclude,
+            account_required,
+        } = value;
+        Ok(Self {
+            simulate_all: simulate_all.unwrap_or_default(),
+            account_include: account_include
+                .into_iter()
+                .map(Pubkey::try_from)
+                .collect::<Result<_, _>>()
+                .map_err(|_| PbsError::SimulationSettingsError)?,
+            account_exclude: account_exclude
+                .into_iter()
+                .map(Pubkey::try_from)
+                .collect::<Result<_, _>>()
+                .map_err(|_| PbsError::SimulationSettingsError)?,
+            account_required: account_required
+                .into_iter()
+                .map(Pubkey::try_from)
+                .collect::<Result<_, _>>()
+                .map_err(|_| PbsError::SimulationSettingsError)?,
+        })
+    }
 }
