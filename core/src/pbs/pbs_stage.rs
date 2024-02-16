@@ -321,7 +321,7 @@ impl PbsEngineStage {
 
         let pbs_client = PbsValidatorClient::with_interceptor(
             pbs_channel,
-            AuthInterceptor::new(cluster_info.keypair().pubkey().to_string()),
+            AuthInterceptor::new(local_config.uuid.clone(), cluster_info.keypair().pubkey()),
         );
 
         Self::start_consuming(
@@ -557,6 +557,14 @@ impl PbsEngineStage {
     pub fn is_valid_pbs_config(config: &PbsConfig) -> bool {
         if config.pbs_url.is_empty() {
             warn!("can't connect to pbs. missing pbs_url.");
+            return false;
+        }
+        if config.uuid.is_empty() {
+            warn!("can't connect to pbs. missing uuid.");
+            return false;
+        }
+        if let Err(e) = tonic::metadata::MetadataValue::try_from(&config.uuid) {
+            warn!("can't connect to pbs. invalid uuid - {}", e.to_string());
             return false;
         }
         true

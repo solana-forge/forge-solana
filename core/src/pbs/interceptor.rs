@@ -1,4 +1,5 @@
 use {
+    solana_sdk::pubkey::Pubkey,
     solana_version::version,
     tonic::{service::Interceptor, Request, Status},
 };
@@ -6,12 +7,14 @@ use {
 pub(crate) struct AuthInterceptor {
     uuid: String,
     version: String,
+    pubkey: Pubkey,
 }
 
 impl AuthInterceptor {
-    pub(crate) fn new(uuid: String) -> Self {
+    pub(crate) fn new(uuid: String, pubkey: Pubkey) -> Self {
         Self {
             uuid,
+            pubkey,
             version: version!().to_string(),
         }
     }
@@ -25,6 +28,9 @@ impl Interceptor for AuthInterceptor {
         request
             .metadata_mut()
             .insert("version", self.version.parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("validator", self.pubkey.to_string().parse().unwrap());
 
         Ok(request)
     }
