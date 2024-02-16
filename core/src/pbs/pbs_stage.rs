@@ -9,15 +9,18 @@ use {
     forge_protos::proto::pbs::{
         pbs_validator_client::PbsValidatorClient, BundlesResponse,
         SanitizedTransaction as ProtoSanitizedTransaction, SanitizedTransactionRequest,
-        SimulationSettingsRequest, SimulationSettingsResponse,
+        SubscriptionFiltersRequest, SubscriptionFiltersResponse,
     },
     futures::StreamExt,
     prost_types::Timestamp,
+    solana_bundle::bundle_execution::{load_and_execute_bundle, LoadAndExecuteBundleError},
     solana_gossip::cluster_info::ClusterInfo,
     solana_perf::packet::PacketBatch,
     solana_poh::poh_recorder::PohRecorder,
-    solana_runtime::bank_forks::BankForks,
+    solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_sdk::{
+        bundle::{derive_bundle_id, SanitizedBundle},
+        clock::MAX_PROCESSING_AGE,
         pubkey::Pubkey,
         saturating_add_assign,
         signature::Signer,
@@ -59,7 +62,13 @@ struct PbsStageStats {
     num_empty_packet_batches: u64,
     num_sanitized_transactions: u64,
     num_empty_tx_batches: u64,
-    num_simulated_transactions: u64,
+
+    num_filtered_for_sims: u64,
+    num_failed_sims: u64,
+    num_proc_time_exceeded_sims: u64,
+    num_invalid_accs_sims: u64, // should never happen
+    num_lock_err_sims: u64,
+    num_success_simulations: u64,
 }
 
 impl PbsStageStats {
@@ -91,11 +100,31 @@ impl PbsStageStats {
         );
         datapoint_info!(
             "pbs_stage-stats",
+            ("num_failed_sims", self.num_failed_sims, i64),
+        );
+        datapoint_info!(
+            "pbs_stage-stats",
+            ("num_filtered_for_sims", self.num_filtered_for_sims, i64),
+        );
+        datapoint_info!(
+            "pbs_stage-stats",
             (
-                "num_simulated_transactions",
-                self.num_simulated_transactions,
+                "num_proc_time_exceeded_sims",
+                self.num_proc_time_exceeded_sims,
                 i64
             ),
+        );
+        datapoint_info!(
+            "pbs_stage-stats",
+            ("num_lock_err_sims", self.num_lock_err_sims, i64),
+        );
+        datapoint_info!(
+            "pbs_stage-stats",
+            ("num_success_simulations", self.num_success_simulations, i64),
+        );
+        datapoint_info!(
+            "pbs_stage-stats",
+            ("num_invalid_accs_sims", self.num_invalid_accs_sims, i64),
         );
     }
 }
@@ -346,9 +375,9 @@ impl PbsEngineStage {
             AuthInterceptor::new(local_config.uuid.clone(), cluster_info.keypair().pubkey()),
         );
 
-        let simulation_settings = timeout(
+        let subscription_filters = timeout(
             *connection_timeout,
-            pbs_client.get_simulation_settings(SimulationSettingsRequest {}),
+            pbs_client.get_subscription_filters(SubscriptionFiltersRequest {}),
         )
         .await
         .map_err(|_| PbsError::MethodTimeout("pbs_simulation_settings".to_string()))?
@@ -367,7 +396,7 @@ impl PbsEngineStage {
             bank_forks,
             slot_boundary_receiver,
             connection_timeout,
-            &simulation_settings,
+            &subscription_filters,
         )
         .await
     }
@@ -384,7 +413,7 @@ impl PbsEngineStage {
         bank_forks: &Arc<RwLock<BankForks>>,
         slot_boundary_receiver: &mut tokio::sync::watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
-        simulation_settings: &SimulationSettings,
+        subscription_filters: &SubscriptionFilters,
     ) -> Result<(), PbsError> {
         const METRICS_TICK: Duration = Duration::from_secs(1);
 
@@ -494,23 +523,25 @@ impl PbsEngineStage {
             return Ok(());
         }
 
-        let bank = bank_forks.read().unwrap().working_bank();
+        let transactions: Vec<_> = {
+            let bank = bank_forks.read().unwrap().working_bank();
 
-        let transactions: Vec<_> = packet_batches
-            .0
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .iter()
-                    .filter(|packet| !packet.meta().discard())
-                    .filter_map(|packet| {
-                        let tx = packet.deserialize_slice(..).ok()?;
-                        SanitizedTransaction::try_create(tx, MessageHash::Compute, None, &*bank)
-                            .ok()
-                            .and_then(sanitized_to_proto_sanitized)
-                    })
-            })
-            .collect();
+            packet_batches
+                .0
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .iter()
+                        .filter(|packet| !packet.meta().discard())
+                        .filter_map(|packet| {
+                            let tx = packet.deserialize_slice(..).ok()?;
+                            SanitizedTransaction::try_create(tx, MessageHash::Compute, None, &*bank)
+                                .ok()
+                                .and_then(sanitized_to_proto_sanitized)
+                        })
+                })
+                .collect()
+        };
 
         if transactions.is_empty() {
             saturating_add_assign!(pbs_stats.num_empty_tx_batches, 1);
@@ -527,6 +558,7 @@ impl PbsEngineStage {
                     nanos: ts.subsec_nanos() as i32,
                 }),
                 transactions,
+                transactions_with_simulation: Vec::new(),
             })
             .is_err()
         {
@@ -539,6 +571,72 @@ impl PbsEngineStage {
         );
 
         Ok(())
+    }
+
+    fn simulate_transactions(
+        sanitized_transactions: Vec<SanitizedTransaction>,
+        bank: &Bank,
+        simulation_settings: &SubscriptionFilters,
+        pbs_stats: &mut PbsStageStats,
+    ) {
+        const MAX_BUNDLE_SIMULATION_TIME: Duration = Duration::from_millis(50);
+
+        let _ = sanitized_transactions.into_iter().filter_map(|tx| {
+            if !simulation_settings.is_tx_have_to_be_processed(&tx) {
+                return None;
+            }
+            saturating_add_assign!(pbs_stats.num_filtered_for_sims, 1);
+
+            let sanitized_bundle = SanitizedBundle {
+                bundle_id: derive_bundle_id(&[tx.to_versioned_transaction()]),
+                transactions: vec![tx.clone()],
+            };
+            let pre_execution_accounts = vec![None];
+            let post_execution_accounts = vec![None];
+
+            let bundle_execution_result = load_and_execute_bundle(
+                &bank,
+                &sanitized_bundle,
+                MAX_PROCESSING_AGE,
+                &MAX_BUNDLE_SIMULATION_TIME,
+                true,
+                false,
+                false,
+                false,
+                &None,
+                true,
+                None,
+                &pre_execution_accounts,
+                &post_execution_accounts,
+            );
+
+            match bundle_execution_result.result() {
+                Ok(()) => {}
+                Err(LoadAndExecuteBundleError::TransactionError { .. }) => {
+                    saturating_add_assign!(pbs_stats.num_failed_sims, 1);
+                    return None;
+                }
+                Err(LoadAndExecuteBundleError::ProcessingTimeExceeded(_)) => {
+                    saturating_add_assign!(pbs_stats.num_proc_time_exceeded_sims, 1);
+                    return None;
+                }
+                Err(LoadAndExecuteBundleError::InvalidPreOrPostAccounts) => {
+                    // Should never happen
+                    saturating_add_assign!(pbs_stats.num_invalid_accs_sims, 1);
+                    return None;
+                }
+                Err(LoadAndExecuteBundleError::LockError { .. }) => {
+                    saturating_add_assign!(pbs_stats.num_lock_err_sims, 1);
+                    return None;
+                }
+            }
+
+            // bundle_execution_result.bundle_transaction_results()[0].execution_results()[0].details().unwrap()
+
+            Some(tx)
+        });
+
+        todo!()
     }
 
     async fn delay_packet_batches(
@@ -713,39 +811,83 @@ fn is_poh_recorder_in_progress(poh_recorder: &Arc<RwLock<PohRecorder>>) -> bool 
         .unwrap_or_default()
 }
 
-struct SimulationSettings {
-    simulate_all: bool,
+struct SubscriptionFilters {
+    stream_all: bool,
     account_include: Vec<Pubkey>,
     account_exclude: Vec<Pubkey>,
     account_required: Vec<Pubkey>,
 }
 
-impl TryFrom<SimulationSettingsResponse> for SimulationSettings {
+impl TryFrom<SubscriptionFiltersResponse> for SubscriptionFilters {
     type Error = PbsError;
-    fn try_from(value: SimulationSettingsResponse) -> Result<Self, Self::Error> {
-        let SimulationSettingsResponse {
-            simulate_all,
+    fn try_from(value: SubscriptionFiltersResponse) -> Result<Self, Self::Error> {
+        let SubscriptionFiltersResponse {
+            stream_all,
             account_include,
             account_exclude,
             account_required,
         } = value;
+
         Ok(Self {
-            simulate_all: simulate_all.unwrap_or_default(),
-            account_include: account_include
-                .into_iter()
-                .map(Pubkey::try_from)
-                .collect::<Result<_, _>>()
-                .map_err(|_| PbsError::SimulationSettingsError)?,
-            account_exclude: account_exclude
-                .into_iter()
-                .map(Pubkey::try_from)
-                .collect::<Result<_, _>>()
-                .map_err(|_| PbsError::SimulationSettingsError)?,
-            account_required: account_required
-                .into_iter()
-                .map(Pubkey::try_from)
-                .collect::<Result<_, _>>()
-                .map_err(|_| PbsError::SimulationSettingsError)?,
+            stream_all: stream_all.unwrap_or_default(),
+            account_include: decode_pubkeys_into_vec(account_include)?,
+            account_exclude: decode_pubkeys_into_vec(account_exclude)?,
+            account_required: decode_pubkeys_into_vec(account_required)?,
         })
+    }
+}
+
+fn decode_pubkeys_into_vec(pubkeys: Vec<Vec<u8>>) -> Result<Vec<Pubkey>, PbsError> {
+    let mut vec: Vec<_> = pubkeys
+        .into_iter()
+        .map(Pubkey::try_from)
+        .collect::<Result<_, _>>()
+        .map_err(|_| PbsError::SimulationSettingsError)?;
+    vec.sort();
+    Ok(vec)
+}
+
+impl SubscriptionFilters {
+    pub fn is_tx_have_to_be_processed(&self, transaction: &SanitizedTransaction) -> bool {
+        if self.stream_all {
+            return true;
+        }
+
+        let accounts = transaction.message().account_keys();
+
+        if !self.account_include.is_empty()
+            && accounts
+                .iter()
+                .all(|pubkey| self.account_include.binary_search(pubkey).is_err())
+        {
+            return false;
+        }
+
+        if !self.account_exclude.is_empty()
+            && accounts
+                .iter()
+                .any(|pubkey| self.account_exclude.binary_search(pubkey).is_ok())
+        {
+            return false;
+        }
+
+        if !self.account_required.is_empty() {
+            let mut other: Vec<&Pubkey> = accounts.iter().collect();
+
+            let is_subset = if self.account_required.len() <= other.len() {
+                other.sort();
+                self.account_required
+                    .iter()
+                    .all(|pubkey| other.binary_search(&pubkey).is_ok())
+            } else {
+                false
+            };
+
+            if !is_subset {
+                return false;
+            }
+        }
+
+        true
     }
 }

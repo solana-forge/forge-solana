@@ -25,15 +25,54 @@ message SanitizedTransaction {
   bytes loaded_addresses = 3;
 }
 
+message TransactionWithSimulationResult {
+  SanitizedTransaction transaction = 1;
+  oneof simulation {
+      TransactionError transaction_error = 2;
+      BundleError bundle_error = 3;
+      SimulationResult simulation_result = 4;
+  }
+}
+
+message TransactionError {
+  string err = 1;
+}
+
+enum BundleError {
+  BUNDLE_ERROR_UNSPECIFIED = 0;
+  BUNDLE_ERROR_PROCESSING_TIME_EXCEEDED = 1;
+  BUNDLE_ERROR_LOCK_ERROR = 2;
+  BUNDLE_ERROR_INVALID_PRE_OR_POST_ACCOUNTS = 3;
+}
+
+message SimulationResult {
+  repeated InnerInstructions inner_instructions = 1;
+  bool inner_instructions_none = 2;
+}
+
+message InnerInstructions {
+  repeated InnerInstruction instructions = 1;
+}
+
+message InnerInstruction {
+  uint32 program_id_index = 1;
+  bytes accounts = 2;
+  bytes data = 3;
+
+  // Invocation stack height of an inner instruction.
+  uint32 stack_height = 4;
+}
+
 message SanitizedTransactionRequest {
   google.protobuf.Timestamp ts = 1;
   repeated SanitizedTransaction transactions = 2;
+  repeated TransactionWithSimulationResult transactions_with_simulation = 3;
 }
 
-message SimulationSettingsRequest {}
+message SubscriptionFiltersRequest {}
 
-message SimulationSettingsResponse {
-  optional bool simulate_all = 1;
+message SubscriptionFiltersResponse {
+  optional bool stream_all = 1;
   repeated bytes account_include = 2;
   repeated bytes account_exclude = 3;
   repeated bytes account_required = 4;
@@ -42,5 +81,5 @@ message SimulationSettingsResponse {
 /// Validators can connect to PBS to send packets and receive and bundles.
 service PbsValidator {
   rpc SubscribeSanitized (stream SanitizedTransactionRequest) returns (stream BundlesResponse) {}
-  rpc GetSimulationSettings (SimulationSettingsRequest) returns (SimulationSettingsResponse) {}
+  rpc GetSubscriptionFilters (SubscriptionFiltersRequest) returns (SubscriptionFiltersResponse) {}
 }
