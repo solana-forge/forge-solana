@@ -28,4 +28,7 @@ pub enum PbsError {
 
     #[error("PacketForwardError")]
     PacketForwardError,
+
+    #[error("SlotBoundaryCheckerError")]
+    SlotBoundaryCheckerError,
 }

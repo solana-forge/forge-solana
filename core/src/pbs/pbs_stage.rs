@@ -171,7 +171,7 @@ impl PbsEngineStage {
             exit.clone(),
         );
 
-        let (slot_boundary_sender, slot_boundary_receiver) =
+        let (slot_boundary_sender, mut slot_boundary_receiver) =
             tokio::sync::watch::channel(SlotBoundaryStatus::default());
         let slot_boundary_checker_join_handle =
             Self::start_slot_boundary_checker(poh_recorder, slot_boundary_sender, exit.clone());
@@ -182,7 +182,7 @@ impl PbsEngineStage {
             banking_packet_sender,
             pbs_sender,
             exit.clone(),
-            slot_boundary_receiver,
+            slot_boundary_receiver.clone(),
         );
 
         while !exit.load(Ordering::Relaxed) {
@@ -206,6 +206,7 @@ impl PbsEngineStage {
                 &is_pbs_active,
                 &exit,
                 &bank_forks,
+                &mut slot_boundary_receiver,
                 &CONNECTION_TIMEOUT,
             )
             .await
@@ -263,15 +264,13 @@ impl PbsEngineStage {
                 break;
             };
             if is_pbs_active.load(Ordering::Relaxed) {
-                if let Err(_) = pbs_sender.send(packet_batch) {
+                if pbs_sender.send(packet_batch).is_err() {
                     error!("psb stage packet consumer closed");
                     break;
                 }
-            } else {
-                if let Err(_) = banking_packet_sender.send(packet_batch) {
-                    error!("banking packet sender closed");
-                    break;
-                }
+            } else if banking_packet_sender.send(packet_batch).is_err() {
+                error!("banking packet sender closed");
+                break;
             }
         }
     }
@@ -292,6 +291,7 @@ impl PbsEngineStage {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn connect_and_stream(
         local_config: &PbsConfig,
         global_config: &Arc<Mutex<PbsConfig>>,
@@ -301,6 +301,7 @@ impl PbsEngineStage {
         is_pbs_active: &Arc<AtomicBool>,
         exit: &Arc<AtomicBool>,
         bank_forks: &Arc<RwLock<BankForks>>,
+        slot_boundary_receiver: &mut tokio::sync::watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
     ) -> Result<(), PbsError> {
         let mut backend_endpoint = Endpoint::from_shared(local_config.pbs_url.clone())
@@ -343,11 +344,13 @@ impl PbsEngineStage {
             is_pbs_active,
             exit,
             bank_forks,
+            slot_boundary_receiver,
             connection_timeout,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_consuming(
         local_config: &PbsConfig,
         global_config: &Arc<Mutex<PbsConfig>>,
@@ -357,6 +360,7 @@ impl PbsEngineStage {
         is_pbs_active: &Arc<AtomicBool>,
         exit: &Arc<AtomicBool>,
         bank_forks: &Arc<RwLock<BankForks>>,
+        slot_boundary_receiver: &mut tokio::sync::watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
     ) -> Result<(), PbsError> {
         const METRICS_TICK: Duration = Duration::from_secs(1);
@@ -373,17 +377,32 @@ impl PbsEngineStage {
         .map_err(|e| PbsError::MethodError(e.to_string()))?
         .into_inner();
 
-        is_pbs_active.store(true, Ordering::Relaxed);
         let mut pbs_stats = PbsStageStats::default();
+        let mut retry_bundles = Vec::new();
+        let mut slot_boundary_status = *slot_boundary_receiver.borrow_and_update();
         let mut metrics_tick = interval(METRICS_TICK);
+        is_pbs_active.store(true, Ordering::Relaxed);
 
         info!("connected to pbs stream");
         while !exit.load(Ordering::Relaxed) {
             tokio::select! {
                 biased;
 
+                maybe_slot_boundary_status = slot_boundary_receiver.changed() => {
+                    maybe_slot_boundary_status.map_err(|_| PbsError::SlotBoundaryCheckerError)?;
+                    slot_boundary_status = *slot_boundary_receiver.borrow_and_update();
+                    if let SlotBoundaryStatus::InProgress = slot_boundary_status {
+                        bundle_tx.send(retry_bundles).map_err(|_| PbsError::PacketForwardError)?;
+                        retry_bundles = Vec::new();
+                    }
+                }
+
                 maybe_bundles = bundles_stream.message() => {
-                    Self::handle_maybe_bundles(maybe_bundles, bundle_tx, &mut pbs_stats)?;
+                    let bundles = Self::handle_maybe_bundles(maybe_bundles, &mut pbs_stats)?;
+                    if let SlotBoundaryStatus::StandBy = slot_boundary_status {
+                        retry_bundles.extend(bundles.clone());
+                    }
+                    bundle_tx.send(bundles).map_err(|_| PbsError::PacketForwardError)?;
                 }
 
                 Some((packet_batch, deadline)) = receiver.recv() => {
@@ -409,24 +428,21 @@ impl PbsEngineStage {
 
     fn handle_maybe_bundles(
         maybe_bundles_response: Result<Option<BundlesResponse>, Status>,
-        bundle_sender: &Sender<Vec<PacketBundle>>,
         pbs_stats: &mut PbsStageStats,
-    ) -> Result<(), PbsError> {
+    ) -> Result<Vec<PacketBundle>, PbsError> {
         let bundles_response = maybe_bundles_response?.ok_or(PbsError::GrpcStreamDisconnected)?;
         let bundles: Vec<PacketBundle> = bundles_response
             .bundles
             .into_iter()
-            .filter_map(|bundle| {
-                Some(PacketBundle {
-                    batch: PacketBatch::new(
-                        bundle
-                            .packets
-                            .into_iter()
-                            .map(proto_packet_to_packet)
-                            .collect(),
-                    ),
-                    bundle_id: bundle.uuid,
-                })
+            .map(|bundle| PacketBundle {
+                batch: PacketBatch::new(
+                    bundle
+                        .packets
+                        .into_iter()
+                        .map(proto_packet_to_packet)
+                        .collect(),
+                ),
+                bundle_id: bundle.uuid,
             })
             .collect();
 
@@ -435,11 +451,7 @@ impl PbsEngineStage {
             pbs_stats.num_bundle_packets,
             bundles.iter().map(|bundle| bundle.batch.len() as u64).sum()
         );
-
-        // NOTE: bundles are sanitized in bundle_sanitizer module
-        bundle_sender
-            .send(bundles)
-            .map_err(|_| PbsError::PacketForwardError)
+        Ok(bundles)
     }
 
     fn handle_packet_batch(
@@ -485,13 +497,16 @@ impl PbsEngineStage {
         let num_sanitized_transactions = transactions.len();
 
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        if let Err(_) = remote_sender.send(SanitizedTransactionRequest {
-            ts: Some(Timestamp {
-                seconds: ts.as_secs() as i64,
-                nanos: ts.subsec_nanos() as i32,
-            }),
-            transactions,
-        }) {
+        if remote_sender
+            .send(SanitizedTransactionRequest {
+                ts: Some(Timestamp {
+                    seconds: ts.as_secs() as i64,
+                    nanos: ts.subsec_nanos() as i32,
+                }),
+                transactions,
+            })
+            .is_err()
+        {
             return Err(PbsError::GrpcStreamDisconnected);
         }
 
@@ -528,7 +543,7 @@ impl PbsEngineStage {
                 biased;
 
                 maybe_slot_boundary_changed = slot_boundary_receiver.changed() => {
-                    if let Err(_) = maybe_slot_boundary_changed {
+                    if maybe_slot_boundary_changed.is_err() {
                         error!("slot boundary checker sender closed");
                         break;
                     }
@@ -551,7 +566,7 @@ impl PbsEngineStage {
                 Some(packet_batch) = delayed_queue.next(), if matches!(status, RunningLeaderStatus::InProgress | RunningLeaderStatus::Completed) => {
                     match packet_batch {
                         Ok(packet_batch) => {
-                            if let Err(_) = banking_packet_sender.send(packet_batch.into_inner()) {
+                            if banking_packet_sender.send(packet_batch.into_inner()).is_err() {
                                 error!("banking packet receiver closed");
                                 break;
                             }
@@ -568,7 +583,7 @@ impl PbsEngineStage {
                 Some(packet_batch) = sigverified_receiver.recv() => {
                     let deadline = Instant::now() + DELAY_PACKET_BATCHES;
                     delayed_queue.insert_at(packet_batch.clone(), deadline);
-                    if let Err(_) = pbs_sender.send((packet_batch, deadline)) {
+                    if pbs_sender.send((packet_batch, deadline)).is_err() {
                         error!("pbs receiver closed");
                         break;
                     }
