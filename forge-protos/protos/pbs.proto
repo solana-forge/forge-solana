@@ -65,7 +65,7 @@ message InnerInstruction {
 
 message SanitizedTransactionRequest {
   google.protobuf.Timestamp ts = 1;
-  repeated SanitizedTransaction transactions = 2;
+  reserved 2;
   repeated TransactionWithSimulationResult transactions_with_simulation = 3;
 }
 

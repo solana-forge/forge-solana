@@ -7,19 +7,26 @@ use {
     },
     crossbeam_channel::Sender,
     forge_protos::proto::pbs::{
-        pbs_validator_client::PbsValidatorClient, BundlesResponse,
+        pbs_validator_client::PbsValidatorClient, transaction_with_simulation_result,
+        BundleError as ProtoBundleError, BundlesResponse,
         SanitizedTransaction as ProtoSanitizedTransaction, SanitizedTransactionRequest,
-        SubscriptionFiltersRequest, SubscriptionFiltersResponse,
+        SimulationResult as ProtoSimulationResult, SubscriptionFiltersRequest,
+        SubscriptionFiltersResponse, TransactionError as ProtoTransactionError,
+        TransactionWithSimulationResult as ProtoTransactionWithSimulationResult,
     },
     futures::StreamExt,
     prost_types::Timestamp,
-    solana_bundle::bundle_execution::{load_and_execute_bundle, LoadAndExecuteBundleError},
+    solana_accounts_db::transaction_results::InnerInstructionsList,
+    solana_bundle::bundle_execution::{
+        load_and_execute_bundle, LoadAndExecuteBundleError, LoadAndExecuteBundleResult,
+    },
     solana_gossip::cluster_info::ClusterInfo,
+    solana_measure::measure_us,
     solana_perf::packet::PacketBatch,
     solana_poh::poh_recorder::PohRecorder,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_sdk::{
-        bundle::{derive_bundle_id, SanitizedBundle},
+        bundle::{derive_bundle_id_from_sanitized_transactions, SanitizedBundle},
         clock::MAX_PROCESSING_AGE,
         pubkey::Pubkey,
         saturating_add_assign,
@@ -27,6 +34,7 @@ use {
         transaction::{MessageHash, SanitizedTransaction},
     },
     std::{
+        slice::from_ref,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
@@ -69,6 +77,8 @@ struct PbsStageStats {
     num_invalid_accs_sims: u64, // should never happen
     num_lock_err_sims: u64,
     num_success_simulations: u64,
+
+    simulation_us: u64,
 }
 
 impl PbsStageStats {
@@ -125,6 +135,10 @@ impl PbsStageStats {
         datapoint_info!(
             "pbs_stage-stats",
             ("num_invalid_accs_sims", self.num_invalid_accs_sims, i64),
+        );
+        datapoint_info!(
+            "pbs_stage-stats",
+            ("simulation_us", self.simulation_us, i64),
         );
     }
 }
@@ -458,7 +472,7 @@ impl PbsEngineStage {
                 }
 
                 Some((packet_batch, deadline)) = receiver.recv() => {
-                    Self::handle_packet_batch(packet_batch, deadline, &remote_sender, bank_forks, &mut pbs_stats)?;
+                    Self::handle_packet_batch(packet_batch, deadline, &remote_sender, bank_forks, subscription_filters, &mut pbs_stats)?;
                 }
 
                 _ = metrics_tick.tick() => {
@@ -511,6 +525,7 @@ impl PbsEngineStage {
         deadline: Instant,
         remote_sender: &UnboundedSender<SanitizedTransactionRequest>,
         bank_forks: &Arc<RwLock<BankForks>>,
+        subscription_filters: &SubscriptionFilters,
         pbs_stats: &mut PbsStageStats,
     ) -> Result<(), PbsError> {
         if deadline < Instant::now() {
@@ -523,7 +538,7 @@ impl PbsEngineStage {
             return Ok(());
         }
 
-        let transactions: Vec<_> = {
+        let transactions_with_simulation: Vec<_> = {
             let bank = bank_forks.read().unwrap().working_bank();
 
             packet_batches
@@ -535,20 +550,70 @@ impl PbsEngineStage {
                         .filter(|packet| !packet.meta().discard())
                         .filter_map(|packet| {
                             let tx = packet.deserialize_slice(..).ok()?;
-                            SanitizedTransaction::try_create(tx, MessageHash::Compute, None, &*bank)
-                                .ok()
-                                .and_then(sanitized_to_proto_sanitized)
+                            SanitizedTransaction::try_create(
+                                tx,
+                                MessageHash::Compute,
+                                None,
+                                bank.as_ref(),
+                            )
+                            .ok()
                         })
+                })
+                .inspect(|_| saturating_add_assign!(pbs_stats.num_sanitized_transactions, 1))
+                .filter(|tx| subscription_filters.is_tx_have_to_be_processed(tx))
+                .inspect(|_| saturating_add_assign!(pbs_stats.num_filtered_for_sims, 1))
+                .filter_map(|tx| {
+                    let (simulation_result, simulation_us) =
+                        measure_us!(simulate(&tx, bank.as_ref()));
+                    saturating_add_assign!(pbs_stats.simulation_us, simulation_us);
+                    let transaction = sanitized_to_proto_sanitized(tx)?;
+
+                    let simulation = match simulation_result {
+                        Ok(simulation_result) => {
+                            saturating_add_assign!(pbs_stats.num_success_simulations, 1);
+                            transaction_with_simulation_result::Simulation::SimulationResult(
+                                simulation_result,
+                            )
+                        }
+                        Err(LoadAndExecuteBundleError::ProcessingTimeExceeded(_)) => {
+                            saturating_add_assign!(pbs_stats.num_proc_time_exceeded_sims, 1);
+                            transaction_with_simulation_result::Simulation::BundleError(
+                                ProtoBundleError::ProcessingTimeExceeded as i32,
+                            )
+                        }
+                        Err(LoadAndExecuteBundleError::LockError { .. }) => {
+                            saturating_add_assign!(pbs_stats.num_lock_err_sims, 1);
+                            transaction_with_simulation_result::Simulation::BundleError(
+                                ProtoBundleError::LockError as i32,
+                            )
+                        }
+                        Err(LoadAndExecuteBundleError::InvalidPreOrPostAccounts) => {
+                            saturating_add_assign!(pbs_stats.num_invalid_accs_sims, 1);
+                            transaction_with_simulation_result::Simulation::BundleError(
+                                ProtoBundleError::InvalidPreOrPostAccounts as i32,
+                            )
+                        }
+                        Err(err @ LoadAndExecuteBundleError::TransactionError { .. }) => {
+                            saturating_add_assign!(pbs_stats.num_failed_sims, 1);
+                            transaction_with_simulation_result::Simulation::TransactionError(
+                                ProtoTransactionError {
+                                    err: err.to_string(),
+                                },
+                            )
+                        }
+                    };
+                    Some(ProtoTransactionWithSimulationResult {
+                        transaction: Some(transaction),
+                        simulation: Some(simulation),
+                    })
                 })
                 .collect()
         };
 
-        if transactions.is_empty() {
+        if transactions_with_simulation.is_empty() {
             saturating_add_assign!(pbs_stats.num_empty_tx_batches, 1);
             return Ok(());
         }
-
-        let num_sanitized_transactions = transactions.len();
 
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         if remote_sender
@@ -557,86 +622,14 @@ impl PbsEngineStage {
                     seconds: ts.as_secs() as i64,
                     nanos: ts.subsec_nanos() as i32,
                 }),
-                transactions,
-                transactions_with_simulation: Vec::new(),
+                transactions_with_simulation,
             })
             .is_err()
         {
             return Err(PbsError::GrpcStreamDisconnected);
         }
 
-        saturating_add_assign!(
-            pbs_stats.num_sanitized_transactions,
-            num_sanitized_transactions as u64
-        );
-
         Ok(())
-    }
-
-    fn simulate_transactions(
-        sanitized_transactions: Vec<SanitizedTransaction>,
-        bank: &Bank,
-        simulation_settings: &SubscriptionFilters,
-        pbs_stats: &mut PbsStageStats,
-    ) {
-        const MAX_BUNDLE_SIMULATION_TIME: Duration = Duration::from_millis(50);
-
-        let _ = sanitized_transactions.into_iter().filter_map(|tx| {
-            if !simulation_settings.is_tx_have_to_be_processed(&tx) {
-                return None;
-            }
-            saturating_add_assign!(pbs_stats.num_filtered_for_sims, 1);
-
-            let sanitized_bundle = SanitizedBundle {
-                bundle_id: derive_bundle_id(&[tx.to_versioned_transaction()]),
-                transactions: vec![tx.clone()],
-            };
-            let pre_execution_accounts = vec![None];
-            let post_execution_accounts = vec![None];
-
-            let bundle_execution_result = load_and_execute_bundle(
-                &bank,
-                &sanitized_bundle,
-                MAX_PROCESSING_AGE,
-                &MAX_BUNDLE_SIMULATION_TIME,
-                true,
-                false,
-                false,
-                false,
-                &None,
-                true,
-                None,
-                &pre_execution_accounts,
-                &post_execution_accounts,
-            );
-
-            match bundle_execution_result.result() {
-                Ok(()) => {}
-                Err(LoadAndExecuteBundleError::TransactionError { .. }) => {
-                    saturating_add_assign!(pbs_stats.num_failed_sims, 1);
-                    return None;
-                }
-                Err(LoadAndExecuteBundleError::ProcessingTimeExceeded(_)) => {
-                    saturating_add_assign!(pbs_stats.num_proc_time_exceeded_sims, 1);
-                    return None;
-                }
-                Err(LoadAndExecuteBundleError::InvalidPreOrPostAccounts) => {
-                    // Should never happen
-                    saturating_add_assign!(pbs_stats.num_invalid_accs_sims, 1);
-                    return None;
-                }
-                Err(LoadAndExecuteBundleError::LockError { .. }) => {
-                    saturating_add_assign!(pbs_stats.num_lock_err_sims, 1);
-                    return None;
-                }
-            }
-
-            // bundle_execution_result.bundle_transaction_results()[0].execution_results()[0].details().unwrap()
-
-            Some(tx)
-        });
-
-        todo!()
     }
 
     async fn delay_packet_batches(
@@ -777,6 +770,33 @@ fn sanitized_to_proto_sanitized(tx: SanitizedTransaction) -> Option<ProtoSanitiz
     })
 }
 
+fn inner_instructions_to_proto(
+    inner_instructions: Option<&InnerInstructionsList>,
+) -> ProtoSimulationResult {
+    use forge_protos::proto::pbs::{
+        InnerInstruction as ProtoInnerInstruction, InnerInstructions as ProtoInnerInstructions,
+    };
+
+    ProtoSimulationResult {
+        inner_instructions: inner_instructions
+            .into_iter()
+            .flatten()
+            .map(|inner_instructions| ProtoInnerInstructions {
+                instructions: inner_instructions
+                    .iter()
+                    .map(|ixn| ProtoInnerInstruction {
+                        program_id_index: ixn.instruction.program_id_index as u32,
+                        accounts: ixn.instruction.accounts.clone(),
+                        data: ixn.instruction.data.clone(),
+                        stack_height: ixn.stack_height as u32,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        inner_instructions_none: inner_instructions.is_none(),
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 enum RunningLeaderStatus {
     #[default]
@@ -890,4 +910,44 @@ impl SubscriptionFilters {
 
         true
     }
+}
+
+fn simulate(
+    tx: &SanitizedTransaction,
+    bank: &Bank,
+) -> LoadAndExecuteBundleResult<ProtoSimulationResult> {
+    const MAX_BUNDLE_SIMULATION_TIME: Duration = Duration::from_millis(50);
+
+    let sanitized_bundle = SanitizedBundle {
+        bundle_id: derive_bundle_id_from_sanitized_transactions(from_ref(tx)),
+        transactions: vec![tx.clone()],
+    };
+
+    let bundle_execution_result = load_and_execute_bundle(
+        bank,
+        &sanitized_bundle,
+        MAX_PROCESSING_AGE,
+        &MAX_BUNDLE_SIMULATION_TIME,
+        true,
+        false,
+        false,
+        false,
+        &None,
+        true,
+        None,
+        &vec![None],
+        &vec![None],
+    );
+
+    bundle_execution_result.result().clone().map(|_| {
+        let inner_instructions = bundle_execution_result
+            .bundle_transaction_results()
+            .first()
+            .and_then(|bundle_execution_result| bundle_execution_result.execution_results().first())
+            .and_then(|transaction_execution_result| transaction_execution_result.details())
+            .and_then(|transaction_execution_details| {
+                transaction_execution_details.inner_instructions.as_ref()
+            });
+        inner_instructions_to_proto(inner_instructions)
+    })
 }
