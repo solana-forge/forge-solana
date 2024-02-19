@@ -1,5 +1,6 @@
 use {thiserror::Error, tonic::Status};
 
+mod forwarder;
 mod interceptor;
 pub mod pbs_stage;
 
