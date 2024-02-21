@@ -1,8 +1,13 @@
 use {thiserror::Error, tonic::Status};
 
+mod delayer;
+mod filters;
 mod forwarder;
+mod grpc;
 mod interceptor;
 pub mod pbs_stage;
+pub mod pbs_stage2;
+mod slot_boundary;
 
 #[derive(Error, Debug)]
 pub enum PbsError {
@@ -33,6 +38,6 @@ pub enum PbsError {
     #[error("SlotBoundaryCheckerError")]
     SlotBoundaryCheckerError,
 
-    #[error("SimulationSettingsError")]
-    SimulationSettingsError,
+    #[error("SubscriptionFiltersError")]
+    SubscriptionFiltersError,
 }

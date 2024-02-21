@@ -1,22 +1,25 @@
-use tokio::time::Instant;
 use {
-    crate::banking_trace::{BankingPacketBatch, BankingPacketReceiver, BankingPacketSender},
+    crate::{
+        banking_trace::{BankingPacketReceiver, BankingPacketSender},
+        pbs::delayer::TimestampedBankingPacketBatch,
+    },
     std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     tokio::{
-        sync::mpsc::UnboundedSender,
+        sync::{mpsc::UnboundedSender, watch},
         task::{self, JoinHandle},
+        time::Instant,
     },
 };
 
 pub struct PacketBatchesForwarder {
     receiver: BankingPacketReceiver,
-    pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
-    banking_sender: BankingPacketSender,
+    delayer: UnboundedSender<TimestampedBankingPacketBatch>,
+    banking: BankingPacketSender,
 
-    is_pbs_active: Arc<AtomicBool>,
+    connection_watch: watch::Receiver<bool>,
     exit: Arc<AtomicBool>,
 }
 
@@ -24,9 +27,9 @@ pub struct PacketBatchesForwarder {
 fn run_packet_batch_forwarder(actor: PacketBatchesForwarder) {
     let PacketBatchesForwarder {
         receiver,
-        pbs_sender,
-        banking_sender,
-        is_pbs_active,
+        delayer,
+        banking,
+        connection_watch,
         exit,
     } = actor;
 
@@ -35,12 +38,12 @@ fn run_packet_batch_forwarder(actor: PacketBatchesForwarder) {
             error!("sigverified packet receiver closed");
             break;
         };
-        if is_pbs_active.load(Ordering::Relaxed) {
-            if pbs_sender.send((packet_batch, Instant::now())).is_err() {
+        if *connection_watch.borrow() {
+            if delayer.send((packet_batch, Instant::now())).is_err() {
                 error!("pbs stage packet receiver close");
                 break;
             }
-        } else if banking_sender.send(packet_batch).is_err() {
+        } else if banking.send(packet_batch).is_err() {
             error!("banking packet sender closed");
             break;
         }
@@ -48,18 +51,18 @@ fn run_packet_batch_forwarder(actor: PacketBatchesForwarder) {
 }
 
 impl PacketBatchesForwarder {
-    pub fn new(
+    pub fn start(
         receiver: BankingPacketReceiver,
-        pbs_sender: UnboundedSender<BankingPacketBatch>,
-        banking_sender: BankingPacketSender,
-        is_pbs_active: Arc<AtomicBool>,
+        delayer: UnboundedSender<TimestampedBankingPacketBatch>,
+        banking: BankingPacketSender,
+        connection_watch: watch::Receiver<bool>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let actor = PacketBatchesForwarder {
             receiver,
-            pbs_sender,
-            banking_sender,
-            is_pbs_active,
+            delayer,
+            banking,
+            connection_watch,
             exit,
         };
 
