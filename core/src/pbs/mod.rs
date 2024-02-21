@@ -6,7 +6,6 @@ mod forwarder;
 mod grpc;
 mod interceptor;
 pub mod pbs_stage;
-pub mod pbs_stage2;
 mod slot_boundary;
 
 #[derive(Error, Debug)]

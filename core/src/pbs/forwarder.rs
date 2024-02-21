@@ -1,7 +1,7 @@
 use {
     crate::{
         banking_trace::{BankingPacketReceiver, BankingPacketSender},
-        pbs::delayer::TimestampedBankingPacketBatch,
+        pbs::{delayer::TimestampedBankingPacketBatch, filters::SubscriptionFilters},
     },
     std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,7 +19,7 @@ pub struct PacketBatchesForwarder {
     delayer: UnboundedSender<TimestampedBankingPacketBatch>,
     banking: BankingPacketSender,
 
-    connection_watch: watch::Receiver<bool>,
+    connection_watch: watch::Receiver<Option<SubscriptionFilters>>,
     exit: Arc<AtomicBool>,
 }
 
@@ -38,7 +38,7 @@ fn run_packet_batch_forwarder(actor: PacketBatchesForwarder) {
             error!("sigverified packet receiver closed");
             break;
         };
-        if *connection_watch.borrow() {
+        if connection_watch.borrow().is_some() {
             if delayer.send((packet_batch, Instant::now())).is_err() {
                 error!("pbs stage packet receiver close");
                 break;
@@ -55,7 +55,7 @@ impl PacketBatchesForwarder {
         receiver: BankingPacketReceiver,
         delayer: UnboundedSender<TimestampedBankingPacketBatch>,
         banking: BankingPacketSender,
-        connection_watch: watch::Receiver<bool>,
+        connection_watch: watch::Receiver<Option<SubscriptionFilters>>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let actor = PacketBatchesForwarder {
