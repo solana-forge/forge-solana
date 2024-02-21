@@ -2,6 +2,7 @@ use {
     crate::{
         banking_trace::{BankingPacketBatch, BankingPacketSender},
         pbs::{
+            extract_first_signature,
             filters::SubscriptionFilters,
             grpc::{PbsBatch, SanitizedTransactionWithSimulationResult, SimulationResult},
             slot_boundary::SlotBoundaryStatus,
@@ -19,10 +20,11 @@ use {
         bundle::{derive_bundle_id_from_sanitized_transactions, SanitizedBundle},
         clock::MAX_PROCESSING_AGE,
         saturating_add_assign,
+        signature::Signature,
         transaction::{MessageHash, SanitizedTransaction},
     },
     std::{
-        collections::VecDeque,
+        collections::{HashSet, VecDeque},
         slice::from_ref,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -139,6 +141,7 @@ pub struct PacketDelayer {
     receiver: UnboundedReceiver<TimestampedBankingPacketBatch>,
     banking: BankingPacketSender,
     pbs: UnboundedSender<PbsBatch>,
+    drop_packets_receiver: UnboundedReceiver<Vec<Signature>>,
     slot_boundary_watch: watch::Receiver<SlotBoundaryStatus>,
     connection_watch: watch::Receiver<Option<SubscriptionFilters>>,
     bank_forks: Arc<RwLock<BankForks>>,
@@ -150,6 +153,7 @@ async fn run_delayer(actor: PacketDelayer) {
         mut receiver,
         banking,
         pbs,
+        mut drop_packets_receiver,
         mut slot_boundary_watch,
         mut connection_watch,
         bank_forks,
@@ -157,10 +161,10 @@ async fn run_delayer(actor: PacketDelayer) {
     } = actor;
 
     let mut stats = PbsDelayerStageStats::default();
-    let mut slot_boundary_status = *slot_boundary_watch.borrow_and_update();
     let mut connection_state = connection_watch.borrow_and_update().clone();
     let mut unprocessed_batches = VecDeque::new();
     let mut delay_queue = DelayQueue::new();
+    let mut drop_signatures: HashSet<Signature> = HashSet::new();
     let mut metrics_tick = interval(Duration::from_secs(1));
 
     while !exit.load(Ordering::Relaxed) {
@@ -172,7 +176,10 @@ async fn run_delayer(actor: PacketDelayer) {
                     error!("slot boundary checker updater closed");
                     break;
                 }
-                slot_boundary_status = *slot_boundary_watch.borrow_and_update();
+                if let SlotBoundaryStatus::StandBy = *slot_boundary_watch.borrow_and_update() {
+                    // Clear drop signatures at the end of leader slot
+                    drop_signatures.clear();
+                }
             }
 
             maybe_connection_changed = connection_watch.changed() => {
@@ -181,12 +188,14 @@ async fn run_delayer(actor: PacketDelayer) {
                     break;
                 }
                 connection_state = connection_watch.borrow_and_update().clone();
-                if connection_state.is_none() {
-                    if immediately_forward(&banking, &mut unprocessed_batches).is_err() {
-                        error!("banking receiver closed");
-                        break;
-                    }
+                if connection_state.is_none() && immediately_forward(&banking, &mut unprocessed_batches).is_err() {
+                    error!("banking receiver closed");
+                    break;
                 }
+            }
+
+            Some(signatures) = drop_packets_receiver.recv() => {
+                drop_signatures.extend(signatures);
             }
 
             Some(packet_batch) = receiver.recv() => {
@@ -209,10 +218,9 @@ async fn run_delayer(actor: PacketDelayer) {
             }
 
             Some(maybe_batch) = delay_queue.next() => {
-                // TODO: filter out bundle packets
                 match maybe_batch {
                     Ok(batch) => {
-                        if banking.send(batch.into_inner()).is_err() {
+                        if handle_delayed_banking_packet_batch(batch.into_inner(), &banking, &drop_signatures).is_err() {
                             error!("banking packet receiver closed");
                             break;
                         }
@@ -260,6 +268,7 @@ impl PacketDelayer {
         receiver: UnboundedReceiver<TimestampedBankingPacketBatch>,
         banking: BankingPacketSender,
         pbs: UnboundedSender<PbsBatch>,
+        drop_packets_receiver: UnboundedReceiver<Vec<Signature>>,
         slot_boundary_watch: watch::Receiver<SlotBoundaryStatus>,
         connection_watch: watch::Receiver<Option<SubscriptionFilters>>,
         bank_forks: Arc<RwLock<BankForks>>,
@@ -269,6 +278,7 @@ impl PacketDelayer {
             receiver,
             banking,
             pbs,
+            drop_packets_receiver,
             slot_boundary_watch,
             connection_watch,
             bank_forks,
@@ -436,4 +446,41 @@ fn immediately_forward(
     }
 
     Ok(())
+}
+
+fn handle_delayed_banking_packet_batch(
+    batch: BankingPacketBatch,
+    banking: &BankingPacketSender,
+    drop_signatures: &HashSet<Signature>,
+) -> Result<(), SendError<BankingPacketBatch>> {
+    let exclude: Vec<_> = batch
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(pos_outer, batch)| {
+            let positions: Vec<_> = batch
+                .iter()
+                .enumerate()
+                .filter_map(|(pos_inner, packet)| {
+                    let signature = extract_first_signature(packet).ok()?;
+                    drop_signatures.contains(&signature).then_some(pos_inner)
+                })
+                .collect();
+            (!positions.is_empty()).then_some((pos_outer, positions))
+        })
+        .collect();
+
+    if exclude.is_empty() {
+        return banking.send(batch);
+    }
+
+    let (mut banking_packet_batch, stats) = batch.as_ref().clone();
+    for (outer, inner) in exclude {
+        let batch = &mut banking_packet_batch[outer];
+        for pos in inner {
+            batch[pos].meta_mut().set_discard(true);
+        }
+    }
+
+    banking.send(BankingPacketBatch::new((banking_packet_batch, stats)))
 }

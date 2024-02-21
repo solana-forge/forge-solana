@@ -4,6 +4,7 @@ use {
         packet_bundle::PacketBundle,
         pbs::{
             delayer::PacketDelayer,
+            extract_first_signature,
             filters::SubscriptionFilters,
             forwarder::PacketBatchesForwarder,
             grpc::{
@@ -27,7 +28,10 @@ use {
     solana_perf::packet::PacketBatch,
     solana_poh::poh_recorder::PohRecorder,
     solana_runtime::bank_forks::BankForks,
-    solana_sdk::{saturating_add_assign, signature::Signer},
+    solana_sdk::{
+        saturating_add_assign,
+        signature::{Signature, Signer},
+    },
     std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -171,11 +175,13 @@ impl PbsEngineStage {
         let (mut slot_boundary_watch, slot_boundary_checker_jh) =
             SlotBoundaryChecker::start(poh_recorder, exit.clone());
         let (delayer_sender, mut pbs_receiver) = mpsc::unbounded_channel();
+        let (drop_packets_sender, drop_packets_receiver) = mpsc::unbounded_channel();
 
         let delayer_jh = PacketDelayer::start(
             delayer_receiver,
             banking_packet_sender.clone(),
             delayer_sender,
+            drop_packets_receiver,
             slot_boundary_watch.clone(),
             connection_watch,
             bank_forks,
@@ -203,6 +209,7 @@ impl PbsEngineStage {
                 &cluster_info,
                 &mut pbs_receiver,
                 &mut connection_updater,
+                &drop_packets_sender,
                 &exit,
                 &mut slot_boundary_watch,
                 &CONNECTION_TIMEOUT,
@@ -239,6 +246,7 @@ impl PbsEngineStage {
         cluster_info: &Arc<ClusterInfo>,
         receiver: &mut UnboundedReceiver<PbsBatch>,
         connection_updater: &mut watch::Sender<Option<SubscriptionFilters>>,
+        drop_packets_sender: &UnboundedSender<Vec<Signature>>,
         exit: &Arc<AtomicBool>,
         slot_boundary_watch: &mut watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
@@ -292,6 +300,7 @@ impl PbsEngineStage {
             receiver,
             connection_updater,
             subscription_filters,
+            drop_packets_sender,
             exit,
             slot_boundary_watch,
             connection_timeout,
@@ -308,6 +317,7 @@ impl PbsEngineStage {
         receiver: &mut UnboundedReceiver<PbsBatch>,
         connection_updater: &mut watch::Sender<Option<SubscriptionFilters>>,
         subscription_filters: SubscriptionFilters,
+        drop_packets_sender: &UnboundedSender<Vec<Signature>>,
         exit: &Arc<AtomicBool>,
         slot_boundary_watch: &mut watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
@@ -352,7 +362,11 @@ impl PbsEngineStage {
                     if let SlotBoundaryStatus::StandBy = slot_boundary_status {
                         retry_bundles.extend(bundles.clone());
                     }
+                    Self::send_bundles_to_delayer(&bundles, drop_packets_sender)?;
+
+                    // NOTE: bundles are sanitized in bundle_sanitizer module
                     bundle_tx.send(bundles).map_err(|_| PbsError::PacketForwardError)?;
+
                 }
 
                 Some(packet_batch) = receiver.recv() => {
@@ -448,6 +462,25 @@ impl PbsEngineStage {
         }
 
         Ok(())
+    }
+
+    fn send_bundles_to_delayer(
+        bundles: &[PacketBundle],
+        drop_packets_sender: &UnboundedSender<Vec<Signature>>,
+    ) -> Result<(), PbsError> {
+        let signatures = bundles
+            .iter()
+            .flat_map(|bundle| {
+                bundle
+                    .batch
+                    .iter()
+                    .filter_map(|packet| extract_first_signature(packet).ok())
+            })
+            .collect();
+
+        drop_packets_sender
+            .send(signatures)
+            .map_err(|_| PbsError::PacketForwardError)
     }
 
     pub fn is_valid_pbs_config(config: &PbsConfig) -> bool {
