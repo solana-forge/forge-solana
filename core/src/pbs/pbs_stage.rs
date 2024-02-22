@@ -344,7 +344,7 @@ impl PbsEngineStage {
             })?;
 
         info!("connected to pbs stream");
-        while exit.load(Ordering::Relaxed) {
+        while !exit.load(Ordering::Relaxed) {
             tokio::select! {
                 biased;
 
