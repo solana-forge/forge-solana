@@ -1,30 +1,38 @@
 use {
     crate::{
-        banking_trace::{BankingPacketBatch, BankingPacketReceiver, BankingPacketSender},
+        banking_trace::{BankingPacketReceiver, BankingPacketSender},
         packet_bundle::PacketBundle,
-        pbs::{interceptor::AuthInterceptor, PbsError},
+        pbs::{
+            delayer::PacketDelayer,
+            extract_first_signature,
+            filters::SubscriptionFilters,
+            forwarder::PacketBatchesForwarder,
+            grpc::{
+                sanitized_to_proto_sanitized, simulation_result_to_proto_simulation_result,
+                PbsBatch,
+            },
+            interceptor::AuthInterceptor,
+            slot_boundary::{SlotBoundaryChecker, SlotBoundaryStatus},
+            PbsError,
+        },
         proto_packet_to_packet,
     },
-    crossbeam_channel::{SendError, Sender},
+    crossbeam_channel::Sender,
     forge_protos::proto::pbs::{
-        pbs_validator_client::PbsValidatorClient, BundlesResponse,
-        SanitizedTransaction as ProtoSanitizedTransaction, SanitizedTransactionRequest,
+        pbs_validator_client::PbsValidatorClient, BundlesResponse, SanitizedTransactionRequest,
+        SubscriptionFiltersRequest,
+        TransactionWithSimulationResult as ProtoTransactionWithSimulationResult,
     },
-    futures::StreamExt,
     prost_types::Timestamp,
-    reqwest::header,
-    solana_perf::{packet::PacketBatch, sigverify::PacketError},
+    solana_gossip::cluster_info::ClusterInfo,
+    solana_perf::packet::PacketBatch,
+    solana_poh::poh_recorder::PohRecorder,
     solana_runtime::bank_forks::BankForks,
     solana_sdk::{
-        packet::Packet,
         saturating_add_assign,
-        short_vec::decode_shortu16_len,
-        signature::Signature,
-        transaction::{MessageHash, SanitizedTransaction},
+        signature::{Signature, Signer},
     },
     std::{
-        collections::HashSet,
-        mem::size_of,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
@@ -33,13 +41,16 @@ use {
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::{
-        sync::mpsc::{UnboundedReceiver, UnboundedSender},
-        task::{self, JoinHandle as TokioJoinHandle},
-        time::{interval, sleep, timeout, Instant},
+        sync::{
+            mpsc,
+            mpsc::{UnboundedReceiver, UnboundedSender},
+            watch,
+        },
+        task,
+        time::{interval, sleep, timeout},
         try_join,
     },
     tokio_stream::wrappers::UnboundedReceiverStream,
-    tokio_util::time::DelayQueue,
     tonic::{
         codegen::InterceptedService,
         transport::{Channel, Endpoint},
@@ -50,17 +61,21 @@ use {
 const CONNECTION_TIMEOUT_S: u64 = 10;
 const CONNECTION_BACKOFF_S: u64 = 5;
 
-const REQUEST_TIMEOUT_MS: u64 = 300;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PbsConfig {
+    pub pbs_url: String,
+    pub uuid: String,
+}
 
-const BUNDLE_LIFE_TIME_IN_DELAYER_MS: u64 = 400;
+pub struct PbsEngineStage {
+    t_hdls: Vec<JoinHandle<()>>,
+}
 
 #[derive(Default)]
 struct PbsStageStats {
     num_bundles: u64,
     num_bundle_packets: u64,
-    num_missing_deadlines: u64,
     num_empty_packet_batches: u64,
-    num_sanitized_transactions: u64,
     num_empty_tx_batches: u64,
 }
 
@@ -73,10 +88,6 @@ impl PbsStageStats {
         );
         datapoint_info!(
             "pbs_stage-stats",
-            ("num_missing_deadlines", self.num_missing_deadlines, i64),
-        );
-        datapoint_info!(
-            "pbs_stage-stats",
             (
                 "num_empty_packet_batches",
                 self.num_empty_packet_batches,
@@ -85,23 +96,9 @@ impl PbsStageStats {
         );
         datapoint_info!(
             "pbs_stage-stats",
-            ("num_sanitized_transactions", self.num_bundles, i64),
-        );
-        datapoint_info!(
-            "pbs_stage-stats",
             ("num_empty_tx_batches", self.num_empty_tx_batches, i64),
         );
     }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PbsConfig {
-    pub pbs_url: String,
-    pub uuid: String,
-}
-
-pub struct PbsEngineStage {
-    t_hdls: Vec<JoinHandle<()>>,
 }
 
 impl PbsEngineStage {
@@ -109,12 +106,15 @@ impl PbsEngineStage {
         pbs_config: Arc<Mutex<PbsConfig>>,
         // Channel that bundles get piped through.
         bundle_tx: Sender<Vec<PacketBundle>>,
+        // The keypair stored here is used to auth
+        cluster_info: Arc<ClusterInfo>,
         // Channel that trusted packets after SigVerify get piped through.
         sigverified_receiver: BankingPacketReceiver,
         // Channel that trusted packets get piped through.
         banking_packet_sender: BankingPacketSender,
         exit: Arc<AtomicBool>,
         bank_forks: Arc<RwLock<BankForks>>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
     ) -> Self {
         let thread = Builder::new()
             .name("pbs-stage".to_string())
@@ -126,10 +126,12 @@ impl PbsEngineStage {
                 rt.block_on(Self::start(
                     pbs_config,
                     bundle_tx,
+                    cluster_info,
                     sigverified_receiver,
                     banking_packet_sender,
                     exit,
                     bank_forks,
+                    poh_recorder,
                 ));
             })
             .unwrap();
@@ -150,34 +152,43 @@ impl PbsEngineStage {
     async fn start(
         pbs_config: Arc<Mutex<PbsConfig>>,
         bundle_tx: Sender<Vec<PacketBundle>>,
+        cluster_info: Arc<ClusterInfo>,
         sigverified_receiver: BankingPacketReceiver,
         banking_packet_sender: BankingPacketSender,
         exit: Arc<AtomicBool>,
         bank_forks: Arc<RwLock<BankForks>>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
     ) {
         const CONNECTION_TIMEOUT: Duration = Duration::from_secs(CONNECTION_TIMEOUT_S);
         const CONNECTION_BACKOFF: Duration = Duration::from_secs(CONNECTION_BACKOFF_S);
-        let mut error_count: u64 = 0;
 
-        let is_pbs_active = Arc::new(AtomicBool::new(false));
-        let (forwarder_sender, forwarder_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let forwarder_join_handle = Self::start_forward_packet_batches(
+        let (mut connection_updater, connection_watch) = watch::channel(None);
+        let (forwarder_sender, delayer_receiver) = mpsc::unbounded_channel();
+        let forwarder_jh = PacketBatchesForwarder::start(
             sigverified_receiver,
             forwarder_sender,
             banking_packet_sender.clone(),
-            is_pbs_active.clone(),
+            connection_watch.clone(),
             exit.clone(),
         );
 
-        let (pbs_sender, mut pbs_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (drop_packet_sender, bundle_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let delayer_join_handle = Self::start_delayer(
-            forwarder_receiver,
-            banking_packet_sender,
-            pbs_sender,
-            bundle_receiver,
+        let (mut slot_boundary_watch, slot_boundary_checker_jh) =
+            SlotBoundaryChecker::start(poh_recorder, exit.clone());
+        let (delayer_sender, mut pbs_receiver) = mpsc::unbounded_channel();
+        let (drop_packets_sender, drop_packets_receiver) = mpsc::unbounded_channel();
+
+        let delayer_jh = PacketDelayer::start(
+            delayer_receiver,
+            banking_packet_sender.clone(),
+            delayer_sender,
+            drop_packets_receiver,
+            slot_boundary_watch.clone(),
+            connection_watch,
+            bank_forks,
             exit.clone(),
         );
+
+        let mut error_count: u64 = 0;
 
         while !exit.load(Ordering::Relaxed) {
             // Wait until a valid config is supplied (either initially or by admin rpc)
@@ -195,16 +206,24 @@ impl PbsEngineStage {
                 &local_pbs_config,
                 &pbs_config,
                 &bundle_tx,
+                &cluster_info,
                 &mut pbs_receiver,
-                &drop_packet_sender,
-                &is_pbs_active,
+                &mut connection_updater,
+                &drop_packets_sender,
                 &exit,
-                &bank_forks,
+                &mut slot_boundary_watch,
                 &CONNECTION_TIMEOUT,
             )
             .await
             {
-                is_pbs_active.store(false, Ordering::Relaxed);
+                connection_updater.send_if_modified(|connected| {
+                    if connected.is_some() {
+                        *connected = None;
+                        true
+                    } else {
+                        false
+                    }
+                });
 
                 error_count += 1;
                 datapoint_warn!(
@@ -215,84 +234,24 @@ impl PbsEngineStage {
                 sleep(CONNECTION_BACKOFF).await;
             }
         }
-        is_pbs_active.store(false, Ordering::Relaxed);
 
-        try_join!(forwarder_join_handle, delayer_join_handle).unwrap();
+        try_join!(forwarder_jh, delayer_jh, slot_boundary_checker_jh).unwrap();
     }
 
-    // Forward packets from the sigverified_receiver to the banking_packet_sender if pbs isn't ready
-    fn start_forward_packet_batches(
-        sigverified_receiver: BankingPacketReceiver,
-        pbs_sender: UnboundedSender<BankingPacketBatch>,
-        banking_packet_sender: BankingPacketSender,
-        is_pbs_active: Arc<AtomicBool>,
-        exit: Arc<AtomicBool>,
-    ) -> TokioJoinHandle<()> {
-        task::spawn_blocking(move || {
-            Self::forward_packet_batches(
-                sigverified_receiver,
-                pbs_sender,
-                banking_packet_sender,
-                is_pbs_active,
-                exit,
-            )
-        })
-    }
-
-    fn forward_packet_batches(
-        sigverified_receiver: BankingPacketReceiver,
-        pbs_sender: UnboundedSender<BankingPacketBatch>,
-        banking_packet_sender: BankingPacketSender,
-        is_pbs_active: Arc<AtomicBool>,
-        exit: Arc<AtomicBool>,
-    ) {
-        while !exit.load(Ordering::Relaxed) {
-            let Ok(packet_batch) = sigverified_receiver.recv() else {
-                error!("sigverified packet receiver closed");
-                break;
-            };
-            if is_pbs_active.load(Ordering::Relaxed) {
-                if let Err(_) = pbs_sender.send(packet_batch) {
-                    error!("psb stage packet consumer closed");
-                    break;
-                }
-            } else {
-                if let Err(_) = banking_packet_sender.send(packet_batch) {
-                    error!("banking packet sender closed");
-                    break;
-                }
-            }
-        }
-    }
-
-    fn start_delayer(
-        sigverified_receiver: UnboundedReceiver<BankingPacketBatch>,
-        banking_packet_sender: BankingPacketSender,
-        pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
-        bundle_receiver: UnboundedReceiver<Vec<Signature>>,
-        exit: Arc<AtomicBool>,
-    ) -> TokioJoinHandle<()> {
-        tokio::spawn(Self::delay_packet_batches(
-            sigverified_receiver,
-            banking_packet_sender,
-            pbs_sender,
-            bundle_receiver,
-            exit,
-        ))
-    }
-
+    #[allow(clippy::too_many_arguments)]
     async fn connect_and_stream(
         local_config: &PbsConfig,
         global_config: &Arc<Mutex<PbsConfig>>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
-        receiver: &mut UnboundedReceiver<(BankingPacketBatch, Instant)>,
-        drop_packet_sender: &UnboundedSender<Vec<Signature>>,
-        is_pbs_active: &Arc<AtomicBool>,
+        cluster_info: &Arc<ClusterInfo>,
+        receiver: &mut UnboundedReceiver<PbsBatch>,
+        connection_updater: &mut watch::Sender<Option<SubscriptionFilters>>,
+        drop_packets_sender: &UnboundedSender<Vec<Signature>>,
         exit: &Arc<AtomicBool>,
-        bank_forks: &Arc<RwLock<BankForks>>,
+        slot_boundary_watch: &mut watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
     ) -> Result<(), PbsError> {
-        let mut backend_endpoint = Endpoint::from_shared(local_config.pbs_url.clone())
+        let mut endpoint = Endpoint::from_shared(local_config.pbs_url.clone())
             .map_err(|_| {
                 PbsError::PbsConnectionError(format!(
                     "invalid block engine url value: {}",
@@ -302,7 +261,7 @@ impl PbsEngineStage {
             .tcp_keepalive(Some(Duration::from_secs(60)));
 
         if local_config.pbs_url.starts_with("https") {
-            backend_endpoint = backend_endpoint
+            endpoint = endpoint
                 .tls_config(tonic::transport::ClientTlsConfig::new())
                 .map_err(|_| {
                     PbsError::PbsConnectionError(
@@ -313,15 +272,25 @@ impl PbsEngineStage {
 
         debug!("connecting to block engine: {}", local_config.pbs_url);
 
-        let pbs_channel = timeout(*connection_timeout, backend_endpoint.connect())
+        let channel = timeout(*connection_timeout, endpoint.connect())
             .await
             .map_err(|_| PbsError::PbsConnectionTimeout)?
             .map_err(|e| PbsError::PbsConnectionError(e.to_string()))?;
 
-        let pbs_client = PbsValidatorClient::with_interceptor(
-            pbs_channel,
-            AuthInterceptor::new(local_config.uuid.clone()),
+        let mut pbs_client = PbsValidatorClient::with_interceptor(
+            channel,
+            AuthInterceptor::new(local_config.uuid.clone(), cluster_info.keypair().pubkey()),
         );
+
+        let subscription_filters = timeout(
+            *connection_timeout,
+            pbs_client.get_subscription_filters(SubscriptionFiltersRequest {}),
+        )
+        .await
+        .map_err(|_| PbsError::MethodTimeout("pbs_subscription_filters".to_string()))?
+        .map_err(|e| PbsError::MethodError(e.to_string()))?
+        .into_inner()
+        .try_into()?;
 
         Self::start_consuming(
             local_config,
@@ -329,56 +298,79 @@ impl PbsEngineStage {
             pbs_client,
             bundle_tx,
             receiver,
-            drop_packet_sender,
-            is_pbs_active,
+            connection_updater,
+            subscription_filters,
+            drop_packets_sender,
             exit,
-            bank_forks,
+            slot_boundary_watch,
             connection_timeout,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_consuming(
         local_config: &PbsConfig,
         global_config: &Arc<Mutex<PbsConfig>>,
         mut client: PbsValidatorClient<InterceptedService<Channel, AuthInterceptor>>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
-        receiver: &mut UnboundedReceiver<(BankingPacketBatch, Instant)>,
-        drop_packet_sender: &UnboundedSender<Vec<Signature>>,
-        is_pbs_active: &Arc<AtomicBool>,
+        receiver: &mut UnboundedReceiver<PbsBatch>,
+        connection_updater: &mut watch::Sender<Option<SubscriptionFilters>>,
+        subscription_filters: SubscriptionFilters,
+        drop_packets_sender: &UnboundedSender<Vec<Signature>>,
         exit: &Arc<AtomicBool>,
-        bank_forks: &Arc<RwLock<BankForks>>,
+        slot_boundary_watch: &mut watch::Receiver<SlotBoundaryStatus>,
         connection_timeout: &Duration,
     ) -> Result<(), PbsError> {
         const METRICS_TICK: Duration = Duration::from_secs(1);
 
-        let (remote_sender, remote_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let remote_receiver_stream = UnboundedReceiverStream::new(remote_receiver);
+        let (remote_sender, remote_receiver) = mpsc::unbounded_channel();
+        let stream = UnboundedReceiverStream::new(remote_receiver);
 
-        let mut bundles_stream = timeout(
-            *connection_timeout,
-            client.subscribe_sanitized(remote_receiver_stream),
-        )
-        .await
-        .map_err(|_| PbsError::MethodTimeout("pbs_subscribe".to_string()))?
-        .map_err(|e| PbsError::MethodError(e.to_string()))?
-        .into_inner();
+        let mut bundles_stream = timeout(*connection_timeout, client.subscribe_sanitized(stream))
+            .await
+            .map_err(|_| PbsError::MethodTimeout("pbs_subscribe".to_string()))?
+            .map_err(|e| PbsError::MethodError(e.to_string()))?
+            .into_inner();
 
-        is_pbs_active.store(true, Ordering::Relaxed);
         let mut pbs_stats = PbsStageStats::default();
+        let mut retry_bundles = Vec::new();
+        let mut slot_boundary_status = *slot_boundary_watch.borrow_and_update();
         let mut metrics_tick = interval(METRICS_TICK);
+        connection_updater
+            .send(Some(subscription_filters))
+            .map_err(|_| {
+                PbsError::PbsConnectionError("connection watchers are close".to_string())
+            })?;
 
         info!("connected to pbs stream");
         while !exit.load(Ordering::Relaxed) {
             tokio::select! {
                 biased;
 
-                maybe_bundles = bundles_stream.message() => {
-                    Self::handle_maybe_bundles(maybe_bundles, bundle_tx, drop_packet_sender, &mut pbs_stats)?;
+                maybe_slot_boundary_status = slot_boundary_watch.changed() => {
+                    maybe_slot_boundary_status.map_err(|_| PbsError::SlotBoundaryCheckerError)?;
+                    slot_boundary_status = *slot_boundary_watch.borrow_and_update();
+                    if let SlotBoundaryStatus::InProgress = slot_boundary_status {
+                        bundle_tx.send(retry_bundles).map_err(|_| PbsError::PacketForwardError)?;
+                        retry_bundles = Vec::new();
+                    }
                 }
 
-                Some((packet_batch, deadline)) = receiver.recv() => {
-                    Self::handle_packet_batch(packet_batch, deadline, &remote_sender, bank_forks, &mut pbs_stats)?;
+                maybe_bundles = bundles_stream.message() => {
+                    let bundles = Self::handle_maybe_bundles(maybe_bundles, &mut pbs_stats)?;
+                    if let SlotBoundaryStatus::StandBy = slot_boundary_status {
+                        retry_bundles.extend(bundles.clone());
+                    }
+                    Self::send_bundles_to_delayer(&bundles, drop_packets_sender)?;
+
+                    // NOTE: bundles are sanitized in bundle_sanitizer module
+                    bundle_tx.send(bundles).map_err(|_| PbsError::PacketForwardError)?;
+
+                }
+
+                Some(packet_batch) = receiver.recv() => {
+                    Self::handle_packet_batch(packet_batch, &remote_sender, &mut pbs_stats)?;
                 }
 
                 _ = metrics_tick.tick() => {
@@ -400,25 +392,21 @@ impl PbsEngineStage {
 
     fn handle_maybe_bundles(
         maybe_bundles_response: Result<Option<BundlesResponse>, Status>,
-        bundle_sender: &Sender<Vec<PacketBundle>>,
-        delayer_sender: &UnboundedSender<Vec<Signature>>,
         pbs_stats: &mut PbsStageStats,
-    ) -> Result<(), PbsError> {
+    ) -> Result<Vec<PacketBundle>, PbsError> {
         let bundles_response = maybe_bundles_response?.ok_or(PbsError::GrpcStreamDisconnected)?;
         let bundles: Vec<PacketBundle> = bundles_response
             .bundles
             .into_iter()
-            .filter_map(|bundle| {
-                Some(PacketBundle {
-                    batch: PacketBatch::new(
-                        bundle
-                            .packets
-                            .into_iter()
-                            .map(proto_packet_to_packet)
-                            .collect(),
-                    ),
-                    bundle_id: bundle.uuid,
-                })
+            .map(|bundle| PacketBundle {
+                batch: PacketBatch::new(
+                    bundle
+                        .packets
+                        .into_iter()
+                        .map(proto_packet_to_packet)
+                        .collect(),
+                ),
+                bundle_id: bundle.uuid,
             })
             .collect();
 
@@ -427,18 +415,58 @@ impl PbsEngineStage {
             pbs_stats.num_bundle_packets,
             bundles.iter().map(|bundle| bundle.batch.len() as u64).sum()
         );
+        Ok(bundles)
+    }
 
-        Self::send_bundles_to_delayer(&bundles, delayer_sender)?;
+    fn handle_packet_batch(
+        packet_batch: PbsBatch,
+        remote_sender: &UnboundedSender<SanitizedTransactionRequest>,
+        pbs_stats: &mut PbsStageStats,
+    ) -> Result<(), PbsError> {
+        if packet_batch.is_empty() {
+            saturating_add_assign!(pbs_stats.num_empty_packet_batches, 1);
+            return Ok(());
+        }
 
-        // NOTE: bundles are sanitized in bundle_sanitizer module
-        bundle_sender
-            .send(bundles)
-            .map_err(|_| PbsError::PacketForwardError)
+        let transactions_with_simulation: Vec<_> = packet_batch
+            .into_iter()
+            .filter_map(|item| {
+                let transaction = sanitized_to_proto_sanitized(item.transaction)?;
+                let simulation = item
+                    .simulation_result
+                    .map(simulation_result_to_proto_simulation_result);
+                Some(ProtoTransactionWithSimulationResult {
+                    transaction: Some(transaction),
+                    simulation,
+                })
+            })
+            .collect();
+
+        if transactions_with_simulation.is_empty() {
+            saturating_add_assign!(pbs_stats.num_empty_tx_batches, 1);
+            return Ok(());
+        }
+
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        if remote_sender
+            .send(SanitizedTransactionRequest {
+                ts: Some(Timestamp {
+                    seconds: ts.as_secs() as i64,
+                    nanos: ts.subsec_nanos() as i32,
+                }),
+                transactions_with_simulation,
+            })
+            .is_err()
+        {
+            return Err(PbsError::GrpcStreamDisconnected);
+        }
+
+        Ok(())
     }
 
     fn send_bundles_to_delayer(
         bundles: &[PacketBundle],
-        delayer_sender: &UnboundedSender<Vec<Signature>>,
+        drop_packets_sender: &UnboundedSender<Vec<Signature>>,
     ) -> Result<(), PbsError> {
         let signatures = bundles
             .iter()
@@ -450,180 +478,9 @@ impl PbsEngineStage {
             })
             .collect();
 
-        delayer_sender
+        drop_packets_sender
             .send(signatures)
             .map_err(|_| PbsError::PacketForwardError)
-    }
-
-    fn handle_packet_batch(
-        packet_batches: BankingPacketBatch,
-        deadline: Instant,
-        remote_sender: &UnboundedSender<SanitizedTransactionRequest>,
-        bank_forks: &Arc<RwLock<BankForks>>,
-        pbs_stats: &mut PbsStageStats,
-    ) -> Result<(), PbsError> {
-        if deadline < Instant::now() {
-            saturating_add_assign!(pbs_stats.num_missing_deadlines, 1);
-            return Ok(());
-        }
-
-        if packet_batches.0.is_empty() {
-            saturating_add_assign!(pbs_stats.num_empty_packet_batches, 1);
-            return Ok(());
-        }
-
-        let bank = bank_forks.read().unwrap().working_bank();
-
-        let transactions: Vec<_> = packet_batches
-            .0
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .iter()
-                    .filter(|packet| !packet.meta().discard())
-                    .filter_map(|packet| {
-                        let tx = packet.deserialize_slice(..).ok()?;
-                        SanitizedTransaction::try_create(tx, MessageHash::Compute, None, &*bank)
-                            .ok()
-                            .and_then(sanitized_to_proto_sanitized)
-                    })
-            })
-            .collect();
-
-        if transactions.is_empty() {
-            saturating_add_assign!(pbs_stats.num_empty_tx_batches, 1);
-            return Ok(());
-        }
-
-        let num_sanitized_transactions = transactions.len();
-
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        if let Err(_) = remote_sender.send(SanitizedTransactionRequest {
-            ts: Some(Timestamp {
-                seconds: ts.as_secs() as i64,
-                nanos: ts.subsec_nanos() as i32,
-            }),
-            transactions,
-        }) {
-            return Err(PbsError::GrpcStreamDisconnected);
-        }
-
-        saturating_add_assign!(
-            pbs_stats.num_sanitized_transactions,
-            num_sanitized_transactions as u64
-        );
-
-        Ok(())
-    }
-
-    async fn delay_packet_batches(
-        mut sigverified_receiver: UnboundedReceiver<BankingPacketBatch>,
-        banking_packet_sender: BankingPacketSender,
-        pbs_sender: UnboundedSender<(BankingPacketBatch, Instant)>,
-        mut bundle_receiver: UnboundedReceiver<Vec<Signature>>,
-        exit: Arc<AtomicBool>,
-    ) {
-        const DELAY_PACKET_BATCHES: Duration = Duration::from_millis(REQUEST_TIMEOUT_MS);
-
-        let mut delayed_queue: DelayQueue<BankingPacketBatch> = DelayQueue::new();
-
-        let mut bundles: HashSet<Signature> = HashSet::new();
-        let mut bundles_expirations: DelayQueue<Signature> = DelayQueue::new();
-
-        while !exit.load(Ordering::Relaxed) {
-            tokio::select! {
-                biased;
-
-                Some(signatures) = bundle_receiver.recv() => {
-                    Self::handle_bundles_in_delayer(signatures, &mut bundles, &mut bundles_expirations);
-                }
-
-                Some(maybe_signature) = bundles_expirations.next() => {
-                    match maybe_signature {
-                        Ok(signature) => {
-                            bundles.remove(&signature.into_inner());
-                        }
-                        Err(err) => {
-                            warn!("delayed_queue timer error: {}", err.to_string());
-                        }
-                    }
-                }
-
-                Some(maybe_packet_batch) = delayed_queue.next() => {
-                    match maybe_packet_batch {
-                        Ok(packet_batch) => {
-                            if let Err(_) = Self::handle_delayed_banking_packet_batch(packet_batch.into_inner(), &banking_packet_sender, &bundles) {
-                                error!("banking packet receiver closed");
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            warn!("delayed_queue timer error: {}", err.to_string());
-                        }
-                    }
-                }
-
-                Some(packet_batch) = sigverified_receiver.recv() => {
-                    let deadline = Instant::now() + DELAY_PACKET_BATCHES;
-                    delayed_queue.insert_at(packet_batch.clone(), deadline);
-                    if let Err(_) = pbs_sender.send((packet_batch, deadline)) {
-                        error!("pbs receiver closed");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_delayed_banking_packet_batch(
-        banking_packet_batch: BankingPacketBatch,
-        banking_packet_sender: &BankingPacketSender,
-        bundles: &HashSet<Signature>,
-    ) -> Result<(), SendError<BankingPacketBatch>> {
-        let exclude: Vec<_> = banking_packet_batch
-            .0
-            .iter()
-            .enumerate()
-            .filter_map(|(pos_outer, batch)| {
-                let positions: Vec<_> = batch
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(pos_inner, packet)| {
-                        let signature = extract_first_signature(packet).ok()?;
-                        bundles.contains(&signature).then_some(pos_inner)
-                    })
-                    .collect();
-                (!positions.is_empty()).then_some((pos_outer, positions))
-            })
-            .collect();
-
-        if exclude.is_empty() {
-            return banking_packet_sender.send(banking_packet_batch);
-        }
-
-        let (mut banking_packet_batch, stats) = banking_packet_batch.as_ref().clone();
-        for (outer, inner) in exclude {
-            let batch = &mut banking_packet_batch[outer];
-            for pos in inner {
-                batch[pos].meta_mut().set_discard(true);
-            }
-        }
-
-        banking_packet_sender.send(BankingPacketBatch::new((banking_packet_batch, stats)))
-    }
-
-    fn handle_bundles_in_delayer(
-        signatures: Vec<Signature>,
-        bundles: &mut HashSet<Signature>,
-        expirations: &mut DelayQueue<Signature>,
-    ) {
-        for signature in signatures {
-            expirations.insert(
-                signature.clone(),
-                Duration::from_millis(BUNDLE_LIFE_TIME_IN_DELAYER_MS),
-            );
-            bundles.insert(signature);
-        }
     }
 
     pub fn is_valid_pbs_config(config: &PbsConfig) -> bool {
@@ -635,46 +492,10 @@ impl PbsEngineStage {
             warn!("can't connect to pbs. missing uuid.");
             return false;
         }
-        if let Err(e) = header::HeaderValue::from_str(&config.uuid) {
+        if let Err(e) = tonic::metadata::MetadataValue::try_from(&config.uuid) {
             warn!("can't connect to pbs. invalid uuid - {}", e.to_string());
             return false;
         }
         true
     }
-}
-
-fn sanitized_to_proto_sanitized(tx: SanitizedTransaction) -> Option<ProtoSanitizedTransaction> {
-    let versioned_transaction = bincode::serialize(&tx.to_versioned_transaction()).ok()?;
-    let message_hash = tx.message_hash().to_bytes().to_vec();
-    let loaded_addresses = bincode::serialize(&tx.get_loaded_addresses()).ok()?;
-
-    Some(ProtoSanitizedTransaction {
-        versioned_transaction,
-        message_hash,
-        loaded_addresses,
-    })
-}
-
-fn extract_first_signature(packet: &Packet) -> Result<Signature, PacketError> {
-    // should have at least 1 signature and sig lengths
-    let _ = 1usize
-        .checked_add(size_of::<Signature>())
-        .filter(|v| *v <= packet.meta().size)
-        .ok_or(PacketError::InvalidLen)?;
-
-    // read the length of Transaction.signatures (serialized with short_vec)
-    let (_sig_len_untrusted, sig_start) = packet
-        .data(..)
-        .and_then(|bytes| decode_shortu16_len(bytes).ok())
-        .ok_or(PacketError::InvalidShortVec)?;
-
-    let sig_end = sig_start
-        .checked_add(size_of::<Signature>())
-        .ok_or(PacketError::InvalidLen)?;
-
-    packet
-        .data(sig_start..sig_end)
-        .ok_or(PacketError::InvalidLen)?
-        .try_into()
-        .map_err(|_| PacketError::InvalidLen)
 }
