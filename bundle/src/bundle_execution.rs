@@ -262,7 +262,7 @@ pub fn load_and_execute_bundle<'a>(
 
     while chunk_start != bundle.transactions.len() {
         if start_time.elapsed() > *max_processing_time {
-            trace!("bundle: {} took too long to execute", bundle.bundle_id);
+            debug!("bundle: {} took too long to execute", bundle.bundle_id);
             return LoadAndExecuteBundleOutput {
                 bundle_transaction_results,
                 metrics,
