@@ -15,7 +15,7 @@ use {
             slot_boundary::{SlotBoundaryChecker, SlotBoundaryStatus},
             PbsError,
         },
-        proto_packet_to_packet,
+        proto_packet_to_packet_forge,
     },
     crossbeam_channel::Sender,
     forge_protos::proto::pbs::{
@@ -42,8 +42,7 @@ use {
     },
     tokio::{
         sync::{
-            mpsc,
-            mpsc::{UnboundedReceiver, UnboundedSender},
+            mpsc::{self, UnboundedReceiver, UnboundedSender},
             watch,
         },
         task,
@@ -403,7 +402,7 @@ impl PbsEngineStage {
                     bundle
                         .packets
                         .into_iter()
-                        .map(proto_packet_to_packet)
+                        .map(proto_packet_to_packet_forge)
                         .collect(),
                 ),
                 bundle_id: bundle.uuid,

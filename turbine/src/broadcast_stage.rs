@@ -310,6 +310,7 @@ impl BroadcastStage {
             let cluster_info = cluster_info.clone();
             let bank_forks = bank_forks.clone();
             let quic_endpoint_sender = quic_endpoint_sender.clone();
+            let shred_receiver_address = shred_receiver_address.clone();
 
             let run_transmit = move || loop {
                 let res = bs_transmit.transmit(
@@ -461,10 +462,10 @@ pub fn broadcast_shreds(
                 let protocol = cluster_nodes::get_broadcast_protocol(&key);
 
                 let mut addrs = Vec::with_capacity(2);
-                // if let Some(shred_receiver_address) = shred_receiver_address {
-                //     // Assuming always over UDP for shred_receiver_address
-                //     addrs.push((Protocol::UDP, *shred_receiver_address));
-                // }
+                if let Some(shred_receiver_address) = shred_receiver_address {
+                    // Assuming always over UDP for shred_receiver_address
+                    addrs.push((Protocol::UDP, *shred_receiver_address));
+                }
                 if let Some(peer) = cluster_nodes.get_broadcast_peer(&key) {
                     match protocol {
                         Protocol::QUIC => {

@@ -1518,9 +1518,6 @@ pub fn main() {
             log_messages_bytes_limit: value_of(&matches, "log_messages_bytes_limit"),
             ..RuntimeConfig::default()
         },
-        relayer_config: Arc::new(Mutex::new(relayer_config)),
-        block_engine_config: Arc::new(Mutex::new(block_engine_config)),
-        tip_manager_config,
         shred_receiver_address: Arc::new(RwLock::new(
             matches
                 .value_of("shred_receiver_address")
@@ -2106,7 +2103,7 @@ fn process_account_indexes(matches: &ArgMatches) -> AccountSecondaryIndexes {
     }
 }
 
-fn tip_manager_config_from_matches(
+fn _tip_manager_config_from_matches(
     matches: &ArgMatches,
     voting_disabled: bool,
 ) -> TipManagerConfig {

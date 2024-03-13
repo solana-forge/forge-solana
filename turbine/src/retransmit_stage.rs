@@ -179,7 +179,7 @@ fn retransmit(
     shred_deduper: &mut ShredDeduper<2>,
     max_slots: &MaxSlots,
     rpc_subscriptions: Option<&RpcSubscriptions>,
-    // shred_receiver_address: &Arc<RwLock<Option<SocketAddr>>>,
+    shred_receiver_address: &Arc<RwLock<Option<SocketAddr>>>,
 ) -> Result<(), RecvTimeoutError> {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
     let mut shreds = shreds_receiver.recv_timeout(RECV_TIMEOUT)?;
@@ -260,7 +260,7 @@ fn retransmit(
                     &sockets[index % sockets.len()],
                     quic_endpoint_sender,
                     stats,
-                    // &shred_receiver_address.read().unwrap(),
+                    &shred_receiver_address.read().unwrap(),
                 )
                 .map_err(|err| {
                     stats.record_error(&err);
@@ -286,7 +286,7 @@ fn retransmit(
                         &sockets[index % sockets.len()],
                         quic_endpoint_sender,
                         stats,
-                        // &shred_receiver_address.read().unwrap(),
+                        &shred_receiver_address.read().unwrap(),
                     )
                     .map_err(|err| {
                         stats.record_error(&err);
@@ -327,9 +327,9 @@ fn retransmit_shred(
         .into_iter()
         .filter(|addr| socket_addr_space.check(addr))
         .collect();
-    // if let Some(addr) = shred_receiver_addr {
-    //     addrs.push(*addr);
-    // }
+    if let Some(addr) = shred_receiver_addr {
+        addrs.push(*addr);
+    }
 
     compute_turbine_peers.stop();
     stats

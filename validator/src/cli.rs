@@ -60,6 +60,8 @@ const MAX_SNAPSHOT_DOWNLOAD_ABORT: u32 = 5;
 // with less than 2 ticks per slot.
 const MINIMUM_TICKS_PER_SLOT: u64 = 2;
 
+const DEFAULT_RELAYER_EXPECTED_HEARTBEAT_INTERVAL_MS: &str = "500";
+const DEFAULT_RELAYER_MAX_FAILED_HEARTBEATS: &str = "3";
 const DEFAULT_PREALLOCATED_BUNDLE_COST: &str = "3000000";
 
 pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {

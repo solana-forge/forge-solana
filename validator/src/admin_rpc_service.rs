@@ -13,10 +13,6 @@ use {
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
         consensus::{tower_storage::TowerStorage, Tower},
-        proxy::{
-            block_engine_stage::{BlockEngineConfig, BlockEngineStage},
-            relayer_stage::{RelayerConfig, RelayerStage},
-        },
         validator::ValidatorStartProgress,
     },
     solana_geyser_plugin_manager::GeyserPluginManagerRequest,
@@ -34,7 +30,6 @@ use {
         fmt::{self, Display},
         net::SocketAddr,
         path::{Path, PathBuf},
-        str::FromStr,
         sync::{Arc, RwLock},
         thread::{self, Builder},
         time::{Duration, SystemTime},

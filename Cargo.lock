@@ -2210,7 +2210,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forge-protos"
-version = "1.17.22"
+version = "1.17.24"
 dependencies = [
  "bytes",
  "prost",
@@ -6167,6 +6167,8 @@ dependencies = [
  "test-case",
  "thiserror",
  "tokio",
+ "tokio-stream",
+ "tokio-util 0.6.9",
  "tonic",
  "tonic-build",
  "trees",
