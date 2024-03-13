@@ -5,6 +5,7 @@ use {
             extract_first_signature,
             filters::SubscriptionFilters,
             grpc::{PbsBatch, SanitizedTransactionWithSimulationResult, SimulationResult},
+            simulation_result_cache::SimulationResultCache,
             slot_boundary::SlotBoundaryStatus,
         },
     },
@@ -58,6 +59,7 @@ struct PbsDelayerStageStats {
     num_empty_batches: u64,
     num_simulated_chunks: u64,
     num_simulated_txs: u64,
+    num_skip_simulation_txs: u64,
     simulation_us: u64,
 
     num_failed_sims: u64,
@@ -134,6 +136,10 @@ impl PbsDelayerStageStats {
             "pbs_delayer-stats",
             ("num_unprocessed_txs", self.num_unprocessed_txs, i64),
         );
+        datapoint_info!(
+            "pbs_delayer-stats",
+            ("num_skip_simulation_txs", self.num_skip_simulation_txs, i64),
+        );
     }
 }
 
@@ -165,6 +171,7 @@ async fn run_delayer(actor: PacketDelayer) {
     let mut unprocessed_batches = VecDeque::new();
     let mut delay_queue = DelayQueue::new();
     let mut drop_signatures: HashSet<Signature> = HashSet::new();
+    let mut simulation_result_cache = SimulationResultCache::new();
     let mut metrics_tick = interval(Duration::from_secs(1));
 
     while !exit.load(Ordering::Relaxed) {
@@ -177,8 +184,9 @@ async fn run_delayer(actor: PacketDelayer) {
                     break;
                 }
                 if let SlotBoundaryStatus::StandBy = *slot_boundary_watch.borrow_and_update() {
-                    // Clear drop signatures at the end of leader slot
+                    // Clear drop signatures and simulation_result_cache at the end of leader slot
                     drop_signatures.clear();
+                    simulation_result_cache.clear();
                 }
             }
 
@@ -239,8 +247,9 @@ async fn run_delayer(actor: PacketDelayer) {
             Some(batch) = futures::future::ready(unprocessed_batches.front_mut()) => {
                 let pbs_batch = {
                     let bank = bank_forks.read().unwrap().working_bank();
-                    batch.simulate_chunk(bank.as_ref(), SIMULATION_CHUNK_SIZE, &mut stats)
+                    batch.simulate_chunk(bank.as_ref(), SIMULATION_CHUNK_SIZE, &simulation_result_cache, &mut stats)
                 };
+                simulation_result_cache.populate_with_failed_simulations(&pbs_batch);
                 if pbs.send(pbs_batch).is_err() {
                     error!("pbs receiver closed");
                     break;
@@ -352,22 +361,37 @@ impl PacketBatchInProcess {
         &mut self,
         bank: &Bank,
         chunk_size: usize,
+        simulation_result_cache: &SimulationResultCache,
         stats: &mut PbsDelayerStageStats,
     ) -> Vec<SanitizedTransactionWithSimulationResult> {
         let start = self.unprocessed.len().saturating_sub(chunk_size);
+        let batch_size = self.unprocessed.len() - start;
+
         let batch: Vec<_> = self
             .unprocessed
             .drain(start..)
-            .map(|tx| {
+            .filter_map(|tx| {
+                if simulation_result_cache.contains(&tx) {
+                    // Skip simulation and processing of already simulated tx but with different
+                    // blockhash
+                    return None;
+                }
                 let (simulation_result, simulation_us) = measure_us!(simulate(&tx, bank));
                 saturating_add_assign!(stats.simulation_us, simulation_us);
                 collect_simulation_stats(&simulation_result, stats);
-                SanitizedTransactionWithSimulationResult::new(tx, simulation_result)
+                Some(SanitizedTransactionWithSimulationResult::new(
+                    tx,
+                    simulation_result,
+                ))
             })
             .collect();
 
         saturating_add_assign!(stats.num_simulated_chunks, 1);
         saturating_add_assign!(stats.num_simulated_txs, batch.len() as u64);
+        saturating_add_assign!(
+            stats.num_skip_simulation_txs,
+            (batch_size - batch.len()) as u64
+        );
 
         batch
     }
