@@ -4445,9 +4445,7 @@ impl Bank {
         let post_simulation_accounts = loaded_transactions
             .into_iter()
             .next()
-            .unwrap()
-            .0
-            .ok()
+            .and_then(|(loaded_transactions_res, _)| loaded_transactions_res.ok())
             .map(|loaded_transaction| {
                 loaded_transaction
                     .accounts
@@ -4467,7 +4465,12 @@ impl Bank {
 
         debug!("simulate_transaction: {:?}", timings);
 
-        let execution_result = execution_results.pop().unwrap();
+        let execution_result =
+            execution_results
+                .pop()
+                .unwrap_or(TransactionExecutionResult::NotExecuted(
+                    TransactionError::InvalidProgramForExecution,
+                ));
         let flattened_result = execution_result.flattened_result();
         let (logs, return_data) = match execution_result {
             TransactionExecutionResult::Executed { details, .. } => {

@@ -31,7 +31,7 @@ cargo_audit_ignores=(
 
   --ignore RUSTSEC-2022-0093
 
-  # TODO (LB): remove after CI passes
+  # mio
   --ignore RUSTSEC-2024-0019
 )
 scripts/cargo-for-all-lock-files.sh audit "${cargo_audit_ignores[@]}" | $dep_tree_filter
