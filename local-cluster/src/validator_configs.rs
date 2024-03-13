@@ -69,7 +69,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         block_production_method: config.block_production_method.clone(),
         generator_config: config.generator_config.clone(),
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
-        // shred_receiver_address: config.shred_receiver_address.clone(),
+        shred_receiver_address: config.shred_receiver_address.clone(),
         preallocated_bundle_cost: config.preallocated_bundle_cost,
         pbs_config: config.pbs_config.clone(),
     }
