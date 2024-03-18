@@ -371,11 +371,11 @@ impl PacketBatchInProcess {
             .unprocessed
             .drain(start..)
             .filter_map(|tx| {
-                if simulation_result_cache.contains(&tx) {
-                    // Skip simulation and processing of already simulated tx but with different
-                    // blockhash
-                    return None;
-                }
+                // if simulation_result_cache.contains(&tx) {
+                //     // Skip simulation and processing of already simulated tx but with different
+                //     // blockhash
+                //     return None;
+                // }
                 let (simulation_result, simulation_us) = measure_us!(simulate(&tx, bank));
                 saturating_add_assign!(stats.simulation_us, simulation_us);
                 collect_simulation_stats(&simulation_result, stats);
