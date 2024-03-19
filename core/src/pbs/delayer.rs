@@ -371,6 +371,9 @@ impl PacketBatchInProcess {
             .unprocessed
             .drain(start..)
             .filter_map(|tx| {
+                if !bank.is_blockhash_valid(tx.message().recent_blockhash()) {
+                    return None;
+                }
                 // if simulation_result_cache.contains(&tx) {
                 //     // Skip simulation and processing of already simulated tx but with different
                 //     // blockhash
