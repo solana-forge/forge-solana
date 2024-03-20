@@ -45,7 +45,7 @@ use {
 };
 
 const SIMULATION_DEADLINE_MS: u64 = 200;
-const DELAY_PACKET_BATCHES_MS: u64 = 300;
+const DELAY_PACKET_BATCHES_MS: u64 = 500;
 
 const SIMULATION_CHUNK_SIZE: usize = 20;
 const MAX_TX_SIMULATION_TIME_MS: u64 = 10;
@@ -249,12 +249,12 @@ async fn run_delayer(actor: PacketDelayer) {
                     let bank = bank_forks.read().unwrap().working_bank();
                     batch.simulate_chunk(bank.as_ref(), SIMULATION_CHUNK_SIZE, &simulation_result_cache, &mut stats)
                 };
-                simulation_result_cache.populate_with_failed_simulations(&pbs_batch);
+                // simulation_result_cache.populate_with_failed_simulations(&pbs_batch);
                 if pbs.send(pbs_batch).is_err() {
                     error!("pbs receiver closed");
                     break;
                 }
-                if batch.is_empty() || batch.is_simulation_deadline_elapsed() {
+                if batch.is_empty() {
                     if let Some(PacketBatchInProcess {banking_packet_batch, delay_deadline, unprocessed, ..}) = unprocessed_batches.pop_front() {
                         delay_queue.insert_at(banking_packet_batch, delay_deadline);
                         if !unprocessed.is_empty() {
@@ -379,12 +379,12 @@ impl PacketBatchInProcess {
                 //     // blockhash
                 //     return None;
                 // }
-                let (simulation_result, simulation_us) = measure_us!(simulate(&tx, bank));
-                saturating_add_assign!(stats.simulation_us, simulation_us);
-                collect_simulation_stats(&simulation_result, stats);
+                // let (simulation_result, simulation_us) = measure_us!(simulate(&tx, bank));
+                // saturating_add_assign!(stats.simulation_us, simulation_us);
+                // collect_simulation_stats(&simulation_result, stats);
                 Some(SanitizedTransactionWithSimulationResult::new(
                     tx,
-                    simulation_result,
+                    Ok(None),
                 ))
             })
             .collect();
