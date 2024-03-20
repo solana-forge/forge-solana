@@ -2210,7 +2210,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forge-protos"
-version = "1.17.26"
+version = "1.17.27"
 dependencies = [
  "bytes",
  "prost",
@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "jito-protos"
-version = "1.17.26"
+version = "1.17.27"
 dependencies = [
  "bytes",
  "prost",
@@ -5777,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bundle"
-version = "1.17.26"
+version = "1.17.27"
 dependencies = [
  "anchor-lang",
  "assert_matches",
@@ -7293,7 +7293,7 @@ dependencies = [
 
 [[package]]
 name = "solana-runtime-plugin"
-version = "1.17.26"
+version = "1.17.27"
 dependencies = [
  "crossbeam-channel",
  "json5",
@@ -7587,7 +7587,7 @@ dependencies = [
 
 [[package]]
 name = "solana-tip-distributor"
-version = "1.17.26"
+version = "1.17.27"
 dependencies = [
  "anchor-lang",
  "clap 4.3.21",
