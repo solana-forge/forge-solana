@@ -382,10 +382,7 @@ impl PacketBatchInProcess {
                 // let (simulation_result, simulation_us) = measure_us!(simulate(&tx, bank));
                 // saturating_add_assign!(stats.simulation_us, simulation_us);
                 // collect_simulation_stats(&simulation_result, stats);
-                Some(SanitizedTransactionWithSimulationResult::new(
-                    tx,
-                    Ok(None),
-                ))
+                Some(SanitizedTransactionWithSimulationResult::new(tx, Ok(None)))
             })
             .collect();
 

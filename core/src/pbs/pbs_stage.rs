@@ -28,10 +28,7 @@ use {
     solana_perf::packet::PacketBatch,
     solana_poh::poh_recorder::PohRecorder,
     solana_runtime::bank_forks::BankForks,
-    solana_sdk::{
-        saturating_add_assign,
-        signature::{Signature, Signer},
-    },
+    solana_sdk::{saturating_add_assign, signature::Signature},
     std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -183,7 +180,7 @@ impl PbsEngineStage {
             drop_packets_receiver,
             slot_boundary_watch.clone(),
             connection_watch,
-            bank_forks,
+            bank_forks.clone(),
             exit.clone(),
         );
 
@@ -206,6 +203,7 @@ impl PbsEngineStage {
                 &pbs_config,
                 &bundle_tx,
                 &cluster_info,
+                &bank_forks,
                 &mut pbs_receiver,
                 &mut connection_updater,
                 &drop_packets_sender,
@@ -243,6 +241,7 @@ impl PbsEngineStage {
         global_config: &Arc<Mutex<PbsConfig>>,
         bundle_tx: &Sender<Vec<PacketBundle>>,
         cluster_info: &Arc<ClusterInfo>,
+        bank_forks: &Arc<RwLock<BankForks>>,
         receiver: &mut UnboundedReceiver<PbsBatch>,
         connection_updater: &mut watch::Sender<Option<SubscriptionFilters>>,
         drop_packets_sender: &UnboundedSender<Vec<Signature>>,
@@ -276,9 +275,18 @@ impl PbsEngineStage {
             .map_err(|_| PbsError::PbsConnectionTimeout)?
             .map_err(|e| PbsError::PbsConnectionError(e.to_string()))?;
 
+        let blockhash = bank_forks
+            .read()
+            .unwrap()
+            .working_bank()
+            .confirmed_last_blockhash();
         let mut pbs_client = PbsValidatorClient::with_interceptor(
             channel,
-            AuthInterceptor::new(local_config.uuid.clone(), cluster_info.keypair().pubkey()),
+            AuthInterceptor::new(
+                local_config.uuid.clone(),
+                cluster_info.keypair().as_ref(),
+                blockhash,
+            ),
         );
 
         let subscription_filters = timeout(
