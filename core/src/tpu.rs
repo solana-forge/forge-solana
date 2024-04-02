@@ -277,7 +277,7 @@ impl Tpu {
 
         // tip accounts can't be used in BankingStage to avoid someone from stealing tips mid-slot.
         // it also helps reduce surface area for potential account contention
-        let mut blacklisted_accounts = HashSet::new();
+        let blacklisted_accounts = HashSet::new();
         let banking_stage = BankingStage::new(
             block_production_method,
             cluster_info,
