@@ -124,7 +124,6 @@ impl Tpu {
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         block_engine_config: Arc<Mutex<BlockEngineConfig>>,
         relayer_config: Arc<Mutex<RelayerConfig>>,
-        tip_manager_config: TipManagerConfig,
         shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
         preallocated_bundle_cost: u64,
     ) -> Self {
@@ -274,15 +273,11 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
-        let tip_manager = TipManager::new(tip_manager_config);
-
         let bundle_account_locker = BundleAccountLocker::default();
 
         // tip accounts can't be used in BankingStage to avoid someone from stealing tips mid-slot.
         // it also helps reduce surface area for potential account contention
         let mut blacklisted_accounts = HashSet::new();
-        blacklisted_accounts.insert(tip_manager.tip_payment_config_pubkey());
-        blacklisted_accounts.extend(tip_manager.get_tip_accounts());
         let banking_stage = BankingStage::new(
             block_production_method,
             cluster_info,
@@ -308,7 +303,6 @@ impl Tpu {
             replay_vote_sender,
             log_messages_bytes_limit,
             exit.clone(),
-            tip_manager,
             bundle_account_locker,
             &block_builder_fee_info,
             preallocated_bundle_cost,

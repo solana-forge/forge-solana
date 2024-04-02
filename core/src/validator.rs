@@ -26,7 +26,6 @@ use {
         system_monitor_service::{
             verify_net_stats_access, SystemMonitorService, SystemMonitorStatsReportConfig,
         },
-        tip_manager::TipManagerConfig,
         tpu::{Tpu, TpuSockets, DEFAULT_TPU_COALESCE},
         tvu::{Tvu, TvuConfig, TvuSockets},
     },
@@ -270,7 +269,6 @@ pub struct ValidatorConfig {
     pub block_engine_config: Arc<Mutex<BlockEngineConfig>>,
     // Using Option inside RwLock is ugly, but only convenient way to allow toggle on/off
     pub shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
-    pub tip_manager_config: TipManagerConfig,
     pub preallocated_bundle_cost: u64,
 }
 
@@ -343,7 +341,6 @@ impl Default for ValidatorConfig {
             relayer_config: Arc::new(Mutex::new(RelayerConfig::default())),
             block_engine_config: Arc::new(Mutex::new(BlockEngineConfig::default())),
             shred_receiver_address: Arc::new(RwLock::new(None)),
-            tip_manager_config: TipManagerConfig::default(),
             preallocated_bundle_cost: u64::default(),
         }
     }
@@ -1356,7 +1353,6 @@ impl Validator {
             config.generator_config.clone(),
             config.block_engine_config.clone(),
             config.relayer_config.clone(),
-            config.tip_manager_config.clone(),
             config.shred_receiver_address.clone(),
             config.preallocated_bundle_cost,
         );
