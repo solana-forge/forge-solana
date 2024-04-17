@@ -14,6 +14,7 @@ use {
     quinn::{Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime, VarInt},
     quinn_proto::VarIntBoundsExceeded,
     rand::{thread_rng, Rng},
+    smallvec::SmallVec,
     solana_perf::packet::{PacketBatch, PACKETS_PER_BATCH},
     solana_sdk::{
         packet::{Meta, PACKET_DATA_SIZE},
@@ -95,7 +96,7 @@ struct PacketChunk {
 // the Packet and then when copying the Packet into a PacketBatch)
 struct PacketAccumulator {
     pub meta: Meta,
-    pub chunks: Vec<PacketChunk>,
+    pub chunks: SmallVec<[PacketChunk; 2]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -324,6 +325,7 @@ fn handle_and_cache_new_connection(
     connection_table: Arc<Mutex<ConnectionTable>>,
     params: &NewConnectionHandlerParams,
     wait_for_chunk_timeout: Duration,
+    max_unstaked_connections: usize,
 ) -> Result<(), ConnectionHandlerError> {
     if let Ok(max_uni_streams) = VarInt::from_u64(compute_max_allowed_uni_streams(
         connection_table_l.peer_type,
@@ -374,6 +376,7 @@ fn handle_and_cache_new_connection(
                 params.clone(),
                 peer_type,
                 wait_for_chunk_timeout,
+                max_unstaked_connections,
             ));
             Ok(())
         } else {
@@ -414,6 +417,7 @@ async fn prune_unstaked_connections_and_add_new_connection(
             connection_table_clone,
             params,
             wait_for_chunk_timeout,
+            max_connections,
         )
     } else {
         connection.close(
@@ -495,6 +499,16 @@ async fn setup_connection(
                         stats.clone(),
                     ),
                     |(pubkey, stake, total_stake, max_stake, min_stake)| {
+                        // The heuristic is that the stake should be large engouh to have 1 stream pass throuh within one throttle
+                        // interval during which we allow max MAX_STREAMS_PER_100MS streams.
+                        let min_stake_ratio = 1_f64 / MAX_STREAMS_PER_100MS as f64;
+                        let stake_ratio = stake as f64 / total_stake as f64;
+                        let stake = if stake_ratio < min_stake_ratio {
+                            // If it is a staked connection with ultra low stake ratio, treat it as unstaked.
+                            0
+                        } else {
+                            stake
+                        };
                         NewConnectionHandlerParams {
                             packet_sender,
                             remote_pubkey: Some(pubkey),
@@ -524,6 +538,7 @@ async fn setup_connection(
                             staked_connection_table.clone(),
                             &params,
                             wait_for_chunk_timeout,
+                            max_unstaked_connections,
                         ) {
                             stats
                                 .connection_added_from_staked_peer
@@ -707,17 +722,30 @@ fn max_streams_for_connection_in_100ms(
     connection_type: ConnectionPeerType,
     stake: u64,
     total_stake: u64,
+    max_unstaked_connections: usize,
 ) -> u64 {
-    if matches!(connection_type, ConnectionPeerType::Unstaked) || stake == 0 {
+    let max_unstaked_streams_per_100ms = if max_unstaked_connections == 0 {
+        0
+    } else {
         Percentage::from(MAX_UNSTAKED_STREAMS_PERCENT)
             .apply_to(MAX_STREAMS_PER_100MS)
             .saturating_div(MAX_UNSTAKED_CONNECTIONS as u64)
+    };
+
+    let min_staked_streams_per_100ms = if max_unstaked_connections == 0 {
+        const MIN_STAKED_STREAMS: u64 = 1;
+        MIN_STAKED_STREAMS
     } else {
-        const MIN_STAKED_STREAMS: u64 = 8;
+        max_unstaked_streams_per_100ms.saturating_add(1)
+    };
+
+    if matches!(connection_type, ConnectionPeerType::Unstaked) || stake == 0 {
+        max_unstaked_streams_per_100ms
+    } else {
         let max_total_staked_streams: u64 = MAX_STREAMS_PER_100MS
             - Percentage::from(MAX_UNSTAKED_STREAMS_PERCENT).apply_to(MAX_STREAMS_PER_100MS);
         std::cmp::max(
-            MIN_STAKED_STREAMS,
+            min_staked_streams_per_100ms,
             ((max_total_staked_streams as f64 / total_stake as f64) * stake as f64) as u64,
         )
     }
@@ -741,6 +769,7 @@ async fn handle_connection(
     params: NewConnectionHandlerParams,
     peer_type: ConnectionPeerType,
     wait_for_chunk_timeout: Duration,
+    max_unstaked_connections: usize,
 ) {
     let stats = params.stats;
     debug!(
@@ -751,8 +780,12 @@ async fn handle_connection(
     );
     let stable_id = connection.stable_id();
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
-    let max_streams_per_100ms =
-        max_streams_for_connection_in_100ms(peer_type, params.stake, params.total_stake);
+    let max_streams_per_100ms = max_streams_for_connection_in_100ms(
+        peer_type,
+        params.stake,
+        params.total_stake,
+        max_unstaked_connections,
+    );
     let mut last_throttling_instant = tokio::time::Instant::now();
     let mut streams_in_current_interval = 0;
     while !stream_exit.load(Ordering::Relaxed) {
@@ -765,6 +798,18 @@ async fn handle_connection(
                         streams_in_current_interval = 0;
                     } else if streams_in_current_interval >= max_streams_per_100ms {
                         stats.throttled_streams.fetch_add(1, Ordering::Relaxed);
+                        match peer_type {
+                            ConnectionPeerType::Unstaked => {
+                                stats
+                                    .throttled_unstaked_streams
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            ConnectionPeerType::Staked => {
+                                stats
+                                    .throttled_staked_streams
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         let _ = stream.stop(VarInt::from_u32(STREAM_STOP_CODE_THROTTLING));
                         continue;
                     }
@@ -876,9 +921,10 @@ async fn handle_chunk(
                 if packet_accum.is_none() {
                     let mut meta = Meta::default();
                     meta.set_socket_addr(remote_addr);
+                    meta.set_from_staked_node(matches!(peer_type, ConnectionPeerType::Staked));
                     *packet_accum = Some(PacketAccumulator {
                         meta,
-                        chunks: Vec::new(),
+                        chunks: SmallVec::new(),
                     });
                 }
 
@@ -931,6 +977,19 @@ async fn handle_chunk(
                         stats
                             .total_chunks_sent_for_batching
                             .fetch_add(chunks_sent, Ordering::Relaxed);
+
+                        match peer_type {
+                            ConnectionPeerType::Unstaked => {
+                                stats
+                                    .total_unstaked_packets_sent_for_batching
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            ConnectionPeerType::Staked => {
+                                stats
+                                    .total_staked_packets_sent_for_batching
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
 
                         trace!("sent {} byte packet for batching", bytes_sent);
                     }
@@ -1463,7 +1522,7 @@ pub mod test {
             meta.size = size;
             let packet_accum = PacketAccumulator {
                 meta,
-                chunks: vec![PacketChunk {
+                chunks: smallvec::smallvec![PacketChunk {
                     bytes,
                     offset,
                     end_of_chunk: size,
@@ -2055,42 +2114,72 @@ pub mod test {
     fn test_max_streams_for_connection_in_100ms() {
         // 50K packets per ms * 20% / 500 max unstaked connections
         assert_eq!(
-            max_streams_for_connection_in_100ms(ConnectionPeerType::Unstaked, 0, 10000),
+            max_streams_for_connection_in_100ms(
+                ConnectionPeerType::Unstaked,
+                0,
+                10000,
+                MAX_UNSTAKED_CONNECTIONS
+            ),
             20
         );
 
         // 50K packets per ms * 20% / 500 max unstaked connections
         assert_eq!(
-            max_streams_for_connection_in_100ms(ConnectionPeerType::Unstaked, 10, 10000),
+            max_streams_for_connection_in_100ms(
+                ConnectionPeerType::Unstaked,
+                10,
+                10000,
+                MAX_UNSTAKED_CONNECTIONS
+            ),
             20
         );
 
         // If stake is 0, same limits as unstaked connections will apply.
         // 50K packets per ms * 20% / 500 max unstaked connections
         assert_eq!(
-            max_streams_for_connection_in_100ms(ConnectionPeerType::Staked, 0, 10000),
+            max_streams_for_connection_in_100ms(
+                ConnectionPeerType::Staked,
+                0,
+                10000,
+                MAX_UNSTAKED_CONNECTIONS
+            ),
             20
         );
 
         // max staked streams = 50K packets per ms * 80% = 40K
         // function = 40K * stake / total_stake
         assert_eq!(
-            max_streams_for_connection_in_100ms(ConnectionPeerType::Staked, 15, 10000),
+            max_streams_for_connection_in_100ms(
+                ConnectionPeerType::Staked,
+                15,
+                10000,
+                MAX_UNSTAKED_CONNECTIONS
+            ),
             60
         );
 
         // max staked streams = 50K packets per ms * 80% = 40K
         // function = 40K * stake / total_stake
         assert_eq!(
-            max_streams_for_connection_in_100ms(ConnectionPeerType::Staked, 1000, 10000),
+            max_streams_for_connection_in_100ms(
+                ConnectionPeerType::Staked,
+                1000,
+                10000,
+                MAX_UNSTAKED_CONNECTIONS
+            ),
             4000
         );
 
-        // max staked streams = 50K packets per ms * 80% = 40K
-        // minimum staked streams.
+        // max staked streams minimum unstkaed streams + 1.
+        // (50K packets per ms * 20%) / 500 + 1 =
         assert_eq!(
-            max_streams_for_connection_in_100ms(ConnectionPeerType::Staked, 1, 50000),
-            8
+            max_streams_for_connection_in_100ms(
+                ConnectionPeerType::Staked,
+                1,
+                50000,
+                MAX_UNSTAKED_CONNECTIONS
+            ),
+            21
         );
     }
 }
