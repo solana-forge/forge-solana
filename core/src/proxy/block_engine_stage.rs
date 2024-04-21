@@ -203,7 +203,12 @@ impl BlockEngineStage {
                     local_config.block_engine_url
                 ))
             })?
-            .tcp_keepalive(Some(Duration::from_secs(60)));
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .connect_timeout(Duration::from_secs(CONNECTION_TIMEOUT_S))
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(Duration::from_secs(20))
+            .http2_keep_alive_interval(Duration::from_secs(CONNECTION_TIMEOUT_S));
+
         if local_config.block_engine_url.starts_with("https") {
             backend_endpoint = backend_endpoint
                 .tls_config(tonic::transport::ClientTlsConfig::new())
