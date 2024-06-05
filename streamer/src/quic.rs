@@ -56,6 +56,7 @@ impl rustls::server::ClientCertVerifier for SkipClientVerification {
 pub(crate) fn configure_server(
     identity_keypair: &Keypair,
     gossip_host: IpAddr,
+    max_concurrent_connections: usize,
 ) -> Result<(ServerConfig, String), QuicServerError> {
     let (cert, priv_key) = new_self_signed_tls_certificate(identity_keypair, gossip_host)?;
     let cert_chain_pem_parts = vec![Pem {
@@ -71,6 +72,7 @@ pub(crate) fn configure_server(
     server_tls_config.alpn_protocols = vec![ALPN_TPU_PROTOCOL_ID.to_vec()];
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(server_tls_config));
+    server_config.concurrent_connections(max_concurrent_connections as u32);
     server_config.use_retry(true);
     let config = Arc::get_mut(&mut server_config.transport).unwrap();
 
@@ -79,11 +81,7 @@ pub(crate) fn configure_server(
         (QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS.saturating_mul(2)) as u32;
     config.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
     config.stream_receive_window((PACKET_DATA_SIZE as u32).into());
-    config.receive_window(
-        (PACKET_DATA_SIZE as u32)
-            .saturating_mul(MAX_CONCURRENT_UNI_STREAMS)
-            .into(),
-    );
+    config.receive_window((PACKET_DATA_SIZE as u32).into());
     let timeout = IdleTimeout::try_from(QUIC_MAX_TIMEOUT).unwrap();
     config.max_idle_timeout(Some(timeout));
 
@@ -434,6 +432,7 @@ pub fn spawn_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     max_staked_connections: usize,
     max_unstaked_connections: usize,
+    max_streams_per_ms: u64,
     wait_for_chunk_timeout: Duration,
     coalesce: Duration,
 ) -> Result<(Endpoint, thread::JoinHandle<()>), QuicServerError> {
@@ -451,6 +450,7 @@ pub fn spawn_server(
             staked_nodes,
             max_staked_connections,
             max_unstaked_connections,
+            max_streams_per_ms,
             wait_for_chunk_timeout,
             coalesce,
         )
@@ -470,7 +470,9 @@ pub fn spawn_server(
 mod test {
     use {
         super::*,
-        crate::nonblocking::quic::{test::*, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT},
+        crate::nonblocking::quic::{
+            test::*, DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
+        },
         crossbeam_channel::unbounded,
         solana_sdk::net::DEFAULT_TPU_COALESCE,
         std::net::SocketAddr,
@@ -500,6 +502,7 @@ mod test {
             staked_nodes,
             MAX_STAKED_CONNECTIONS,
             MAX_UNSTAKED_CONNECTIONS,
+            DEFAULT_MAX_STREAMS_PER_MS,
             DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
             DEFAULT_TPU_COALESCE,
         )
@@ -556,6 +559,7 @@ mod test {
             staked_nodes,
             MAX_STAKED_CONNECTIONS,
             MAX_UNSTAKED_CONNECTIONS,
+            DEFAULT_MAX_STREAMS_PER_MS,
             DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
             DEFAULT_TPU_COALESCE,
         )
@@ -599,6 +603,7 @@ mod test {
             staked_nodes,
             MAX_STAKED_CONNECTIONS,
             0, // Do not allow any connection from unstaked clients/nodes
+            DEFAULT_MAX_STREAMS_PER_MS,
             DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
             DEFAULT_TPU_COALESCE,
         )
