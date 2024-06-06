@@ -1445,6 +1445,15 @@ pub fn main() {
         trust_packets: matches.is_present("trust_block_engine_packets"),
     };
 
+    let forge_block_engine_config = BlockEngineConfig {
+        block_engine_url: if matches.is_present("forge_block_engine_url") {
+            value_of(&matches, "forge_block_engine_url").expect("couldn't parse block_engine_url")
+        } else {
+            "".to_string()
+        },
+        trust_packets: matches.is_present("trust_block_engine_packets"),
+    };
+
     // Defaults are set in cli definition, safe to use unwrap() here
     let expected_heartbeat_interval_ms: u64 =
         value_of(&matches, "relayer_expected_heartbeat_interval_ms").unwrap();
@@ -1602,6 +1611,7 @@ pub fn main() {
         },
         relayer_config: Arc::new(Mutex::new(relayer_config)),
         block_engine_config: Arc::new(Mutex::new(block_engine_config)),
+        forge_block_engine_config: Arc::new(Mutex::new(forge_block_engine_config)),
         shred_receiver_address: Arc::new(RwLock::new(
             matches
                 .value_of("shred_receiver_address")
