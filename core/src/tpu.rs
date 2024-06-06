@@ -81,6 +81,7 @@ pub struct Tpu {
     staked_nodes_updater_service: StakedNodesUpdaterService,
     tracer_thread_hdl: TracerThread,
     relayer_stage: RelayerStage,
+    forge_block_engine_stage: BlockEngineStage,
     block_engine_stage: BlockEngineStage,
     fetch_stage_manager: FetchStageManager,
     bundle_stage: BundleStage,
@@ -123,6 +124,7 @@ impl Tpu {
         block_production_method: BlockProductionMethod,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         block_engine_config: Arc<Mutex<BlockEngineConfig>>,
+        forge_block_engine_config: Arc<Mutex<BlockEngineConfig>>,
         relayer_config: Arc<Mutex<RelayerConfig>>,
         shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
         preallocated_bundle_cost: u64,
@@ -230,9 +232,21 @@ impl Tpu {
             block_builder_commission: 0,
         }));
 
+        // Jito Block Engine
         let (bundle_sender, bundle_receiver) = unbounded();
         let block_engine_stage = BlockEngineStage::new(
             block_engine_config,
+            bundle_sender.clone(),
+            cluster_info.clone(),
+            packet_sender.clone(),
+            non_vote_sender.clone(),
+            exit.clone(),
+            &block_builder_fee_info,
+        );
+
+        // Forge Block Engine
+        let forge_block_engine_stage = BlockEngineStage::new(
+            forge_block_engine_config,
             bundle_sender,
             cluster_info.clone(),
             packet_sender.clone(),
@@ -351,6 +365,7 @@ impl Tpu {
             tpu_entry_notifier,
             staked_nodes_updater_service,
             tracer_thread_hdl,
+            forge_block_engine_stage,
             block_engine_stage,
             relayer_stage,
             fetch_stage_manager,
@@ -371,6 +386,7 @@ impl Tpu {
             self.bundle_stage.join(),
             self.relayer_stage.join(),
             self.block_engine_stage.join(),
+            self.forge_block_engine_stage.join(),
             self.fetch_stage_manager.join(),
         ];
         let broadcast_result = self.broadcast_stage.join();

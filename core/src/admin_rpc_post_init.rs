@@ -17,6 +17,7 @@ pub struct AdminRpcRequestMetadataPostInit {
     pub vote_account: Pubkey,
     pub repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
     pub block_engine_config: Arc<Mutex<BlockEngineConfig>>,
+    pub forge_block_engine_config: Arc<Mutex<BlockEngineConfig>>,
     pub relayer_config: Arc<Mutex<RelayerConfig>>,
     pub shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
 }

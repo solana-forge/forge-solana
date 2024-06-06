@@ -71,6 +71,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
         relayer_config: config.relayer_config.clone(),
         block_engine_config: config.block_engine_config.clone(),
+        forge_block_engine_config: config.forge_block_engine_config.clone(),
         shred_receiver_address: config.shred_receiver_address.clone(),
         preallocated_bundle_cost: config.preallocated_bundle_cost,
     }

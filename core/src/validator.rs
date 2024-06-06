@@ -267,6 +267,7 @@ pub struct ValidatorConfig {
     pub use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup,
     pub relayer_config: Arc<Mutex<RelayerConfig>>,
     pub block_engine_config: Arc<Mutex<BlockEngineConfig>>,
+    pub forge_block_engine_config: Arc<Mutex<BlockEngineConfig>>,
     // Using Option inside RwLock is ugly, but only convenient way to allow toggle on/off
     pub shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     pub preallocated_bundle_cost: u64,
@@ -340,6 +341,7 @@ impl Default for ValidatorConfig {
             use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
             relayer_config: Arc::new(Mutex::new(RelayerConfig::default())),
             block_engine_config: Arc::new(Mutex::new(BlockEngineConfig::default())),
+            forge_block_engine_config: Arc::new(Mutex::new(BlockEngineConfig::default())),
             shred_receiver_address: Arc::new(RwLock::new(None)),
             preallocated_bundle_cost: u64::default(),
         }
@@ -1111,6 +1113,7 @@ impl Validator {
             vote_account: *vote_account,
             repair_whitelist: config.repair_whitelist.clone(),
             block_engine_config: config.block_engine_config.clone(),
+            forge_block_engine_config: config.forge_block_engine_config.clone(),
             relayer_config: config.relayer_config.clone(),
             shred_receiver_address: config.shred_receiver_address.clone(),
         });
@@ -1351,6 +1354,7 @@ impl Validator {
             &prioritization_fee_cache,
             config.block_production_method.clone(),
             config.generator_config.clone(),
+            config.block_engine_config.clone(),
             config.block_engine_config.clone(),
             config.relayer_config.clone(),
             config.shred_receiver_address.clone(),
