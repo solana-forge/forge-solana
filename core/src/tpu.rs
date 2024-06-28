@@ -84,6 +84,7 @@ pub struct Tpu {
     tracer_thread_hdl: TracerThread,
     relayer_stage: RelayerStage,
     block_engine_stage: BlockEngineStage,
+    forge_block_engine_stage: BlockEngineStage,
     fetch_stage_manager: FetchStageManager,
     bundle_stage: BundleStage,
 }
@@ -125,6 +126,7 @@ impl Tpu {
         block_production_method: BlockProductionMethod,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         block_engine_config: Arc<Mutex<BlockEngineConfig>>,
+        forge_block_engine_config: Arc<Mutex<RelayerConfig>>,
         relayer_config: Arc<Mutex<RelayerConfig>>,
         tip_manager_config: TipManagerConfig,
         shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
@@ -252,6 +254,18 @@ impl Tpu {
             &block_builder_fee_info,
         );
 
+        // Connect forge block engine
+        let forge_block_engine_stage = BlockEngineStage::new(
+            // forge config
+            forge_block_engine_config,
+            bundle_sender,
+            cluster_info.clone(),
+            packet_sender.clone(),
+            non_vote_sender.clone(),
+            exit.clone(),
+            &block_builder_fee_info,
+        );
+
         let (heartbeat_tx, heartbeat_rx) = unbounded();
         let fetch_stage_manager = FetchStageManager::new(
             cluster_info.clone(),
@@ -369,6 +383,7 @@ impl Tpu {
                 staked_nodes_updater_service,
                 tracer_thread_hdl,
                 block_engine_stage,
+                forge_block_engine_stage,
                 relayer_stage,
                 fetch_stage_manager,
                 bundle_stage,
@@ -390,7 +405,9 @@ impl Tpu {
             self.bundle_stage.join(),
             self.relayer_stage.join(),
             self.block_engine_stage.join(),
+            self.forge_block_engine_stage.join(),
             self.fetch_stage_manager.join(),
+
         ];
         let broadcast_result = self.broadcast_stage.join();
         for result in results {

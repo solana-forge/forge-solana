@@ -1406,6 +1406,8 @@ impl Validator {
             config.block_production_method.clone(),
             config.generator_config.clone(),
             config.block_engine_config.clone(),
+            // TODO: forge block engine
+            config.block_engine_config.clone(),
             config.relayer_config.clone(),
             config.tip_manager_config.clone(),
             config.shred_receiver_address.clone(),
