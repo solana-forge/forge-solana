@@ -81,6 +81,12 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .takes_value(true)
         )
         .arg(
+            Arg::with_name("forge_block_engine_url")
+                .long("forge-block-engine-url")
+                .help("Block engine url.  Set to empty string to disable block engine connection.")
+                .takes_value(true)
+        )
+        .arg(
             Arg::with_name("relayer_url")
                 .long("relayer-url")
                 .help("Relayer url. Set to empty string to disable relayer connection.")

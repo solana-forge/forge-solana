@@ -273,6 +273,7 @@ pub struct ValidatorConfig {
     pub wen_restart_proto_path: Option<PathBuf>,
     pub relayer_config: Arc<Mutex<RelayerConfig>>,
     pub block_engine_config: Arc<Mutex<BlockEngineConfig>>,
+    pub forge_block_engine_config: Arc<Mutex<BlockEngineConfig>>,
     // Using Option inside RwLock is ugly, but only convenient way to allow toggle on/off
     pub shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
     pub tip_manager_config: TipManagerConfig,
@@ -348,6 +349,7 @@ impl Default for ValidatorConfig {
             wen_restart_proto_path: None,
             relayer_config: Arc::new(Mutex::new(RelayerConfig::default())),
             block_engine_config: Arc::new(Mutex::new(BlockEngineConfig::default())),
+            forge_block_engine_config: Arc::new(Mutex::new(BlockEngineConfig::default())),
             shred_receiver_address: Arc::new(RwLock::new(None)),
             tip_manager_config: TipManagerConfig::default(),
             preallocated_bundle_cost: u64::default(),

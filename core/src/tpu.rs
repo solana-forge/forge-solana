@@ -126,7 +126,7 @@ impl Tpu {
         block_production_method: BlockProductionMethod,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         block_engine_config: Arc<Mutex<BlockEngineConfig>>,
-        forge_block_engine_config: Arc<Mutex<RelayerConfig>>,
+        forge_block_engine_config: Arc<Mutex<BlockEngineConfig>>,
         relayer_config: Arc<Mutex<RelayerConfig>>,
         tip_manager_config: TipManagerConfig,
         shred_receiver_address: Arc<RwLock<Option<SocketAddr>>>,
@@ -246,7 +246,7 @@ impl Tpu {
         let (bundle_sender, bundle_receiver) = unbounded();
         let block_engine_stage = BlockEngineStage::new(
             block_engine_config,
-            bundle_sender,
+            bundle_sender.clone(),
             cluster_info.clone(),
             packet_sender.clone(),
             non_vote_sender.clone(),
